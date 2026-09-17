@@ -1,0 +1,9 @@
+# Windows metadata
+*:Zone.Identifier
+._*
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.py[cod]
