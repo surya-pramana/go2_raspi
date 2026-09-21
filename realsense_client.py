@@ -22,13 +22,17 @@ Controls:
 import argparse
 import csv
 import os
+import queue
 import socket
 import struct
 import time
+import threading
 from datetime import datetime
 
 import cv2
 import numpy as np
+
+from realsense_io import ButtonStatusClient
 
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -300,7 +304,7 @@ class LatencyLogger:
 # Main client
 # ─────────────────────────────────────────────────────────
 
-def run_client(host, port):
+def run_client(host, port, status_port=8765, no_io=False):
     """Connect to server and display streams."""
     print(f"[CLIENT] Connecting to {host}:{port} ...")
 
@@ -314,7 +318,7 @@ def run_client(host, port):
         print("        Is realsense_server.py running on the Go2?")
         return
 
-    sock.settimeout(None)
+    sock.settimeout(10)
     print(f"[CLIENT] Connected!")
 
     # Clock sync handshake
@@ -327,17 +331,63 @@ def run_client(host, port):
     cv2.namedWindow("RealSense Depth", cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback("RealSense Depth", viewer.mouse_cb)
 
+    io_status = None if no_io else ButtonStatusClient(host, status_port)
+    if io_status is not None:
+        io_status.start()
+        cv2.namedWindow("Button NC / NeoPixel", cv2.WINDOW_AUTOSIZE)
+
+    # Receive TCP away from the GUI so a stalled camera cannot freeze IO status.
+    packets = queue.Queue(maxsize=1)
+    receiver_stop = threading.Event()
+    receiver_error = []
+
+    def receive_packets():
+        try:
+            while not receiver_stop.is_set():
+                packet = recv_frame(sock)
+                item = (packet, time.time())
+                while not receiver_stop.is_set():
+                    try:
+                        packets.put(item, timeout=0.1)
+                        break
+                    except queue.Full:
+                        pass
+        except (OSError, ConnectionError) as exc:
+            if not receiver_stop.is_set():
+                receiver_error.append(str(exc))
+
+    receiver = threading.Thread(target=receive_packets, daemon=True)
+    receiver.start()
+
     fps = 0.0
     frame_count = 0
     t_start = time.time()
     latency_ms = 0.0
     encode_ms = 0.0
     net_ms = 0.0
+    last_video = time.monotonic()
 
     try:
         while True:
-            packet = recv_frame(sock)
-            t_recv = time.time()
+            if io_status is not None:
+                draw_io_status(io_status.snapshot())
+            try:
+                packet, t_recv = packets.get(timeout=0.05)
+            except queue.Empty:
+                # Clear stale video while keeping the independent status window live.
+                if receiver_error or time.monotonic() - last_video > 2:
+                    blank = np.zeros((480, 640, 3), dtype=np.uint8)
+                    label = "Camera disconnected" if receiver_error else "Waiting for video"
+                    cv2.putText(blank, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7, (0, 165, 255), 2)
+                    cv2.imshow("RealSense Color", blank)
+                    cv2.imshow("RealSense Depth", blank)
+                if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+                    break
+                if receiver_error and no_io:
+                    break
+                continue
+            last_video = time.monotonic()
             color_img, depth_viz, depth_raw, h, w, t_capture, t_encoded = \
                 parse_packet(packet)
 
@@ -392,6 +442,14 @@ def run_client(host, port):
     except KeyboardInterrupt:
         print("\n[CLIENT] Stopped.")
     finally:
+        receiver_stop.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        receiver.join(timeout=2)
+        if io_status is not None:
+            io_status.close()
         csv_path = logger.close()
         sock.close()
         cv2.destroyAllWindows()
@@ -405,6 +463,27 @@ def run_client(host, port):
         except Exception as e:
             print(f"[CLIENT] Could not generate report: {e}")
             print(f"[CLIENT] Run manually: python3 visualize_camera_latency.py {csv_path}")
+
+
+def draw_io_status(status):
+    canvas = np.zeros((230, 720, 3), dtype=np.uint8)
+    color = (0, 165, 255)
+    if status is None:
+        lines = ["WebSocket disconnected / status unknown"]
+    elif not status.get("io_running") or status.get("error"):
+        lines = ["GPIO / LED monitoring error", str(status.get("error") or "Stopped")]
+    else:
+        opened = status.get("circuit_open")
+        label = ("Waiting for input" if opened is None else
+                 "STOP / NC OPEN" if opened else "NORMAL / NC CLOSED")
+        color = (0, 0, 255) if opened else (0, 255, 0)
+        lines = [label, f"LED command: {status.get('led_commanded_color')}",
+                 f"Status revision: {status.get('revision')}"]
+    lines.append("Actual LED light: not measured")
+    for index, line in enumerate(lines):
+        cv2.putText(canvas, line[:85], (15, 35 + 40 * index),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
+    cv2.imshow("Button NC / NeoPixel", canvas)
 
 
 if __name__ == '__main__':
@@ -421,5 +500,9 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int,
                         default=int(os.environ.get('GO2_CAMERA_PORT', 9999)),
                         help='TCP port (default: 9999)')
+    parser.add_argument('--status-port', type=int,
+                        default=int(os.environ.get('GO2_STATUS_PORT', 8765)))
+    parser.add_argument('--no-io', action='store_true',
+                        help='Disable button/LED status window')
     args = parser.parse_args()
-    run_client(args.host, args.port)
+    run_client(args.host, args.port, args.status_port, args.no_io)

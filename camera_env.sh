@@ -32,3 +32,11 @@ GO2_CAMERA_PORT="${GO2_CAMERA_PORT:-9999}"
 # Where realsense_server.py is deployed ON the camera host. start_realsense.sh
 # scp's the local copy here before launching it.
 GO2_CAMERA_SERVER_PATH="${GO2_CAMERA_SERVER_PATH:-~/src/camera/realsense_server.py}"
+
+# NC GPIO17 + 30 NeoPixels GPIO18, independent WebSocket status channel.
+GO2_STATUS_PORT="${GO2_STATUS_PORT:-8765}"
+GO2_CAMERA_IO="${GO2_CAMERA_IO:-true}"
+# Absolute interpreter path on the Pi, e.g. /home/sf-system/neopixel-test/.venv/bin/python3
+GO2_CAMERA_PYTHON="${GO2_CAMERA_PYTHON:-python3}"
+# Enable only when the existing NeoPixel driver requires root; sudo -n must work.
+GO2_CAMERA_SUDO="${GO2_CAMERA_SUDO:-false}"

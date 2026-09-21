@@ -26,9 +26,11 @@ echo "[STOP] Stopping server on ${GO2_USER}@${GO2_IP}:${PORT} ..."
 # One remote shell: stop the server gracefully, then force-kill if it lingers,
 # and wait for the port to be released. Exit 0 if stopped, 1 if it wouldn't die.
 # shellcheck disable=SC2086
-$SSH bash -s -- "$PORT" <<'REMOTE'
+$SSH bash -s -- "$PORT" "$GO2_CAMERA_SUDO" <<'REMOTE'
 set -u
 PORT="$1"
+PRIVILEGE=()
+if [ "$2" = "true" ]; then PRIVILEGE=(sudo -n); fi
 
 server_running() { pgrep -f 'python.*realsense_server.py' >/dev/null 2>&1; }
 port_listening() {
@@ -47,8 +49,8 @@ echo "[GO2] Found server (PID: $(pgrep -f 'python.*realsense_server.py' | tr '\n
 
 # 1. Ask it to quit politely (SIGTERM) so it can release the camera cleanly.
 echo "[GO2] Sending TERM ..."
-pkill -TERM -f 'python.*realsense_server.py' 2>/dev/null || true
-for _ in $(seq 1 10); do          # up to ~5s
+"${PRIVILEGE[@]}" pkill -TERM -f 'python.*realsense_server.py' 2>/dev/null || true
+for _ in $(seq 1 30); do          # up to ~15s for camera and GPIO cleanup
     server_running || break
     sleep 0.5
 done
@@ -56,7 +58,7 @@ done
 # 2. If still alive, force it (SIGKILL).
 if server_running; then
     echo "[GO2] Still alive — sending KILL ..."
-    pkill -KILL -f 'python.*realsense_server.py' 2>/dev/null || true
+    "${PRIVILEGE[@]}" pkill -KILL -f 'python.*realsense_server.py' 2>/dev/null || true
     for _ in $(seq 1 6); do        # up to ~3s
         server_running || break
         sleep 0.5

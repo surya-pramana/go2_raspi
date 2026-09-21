@@ -8,7 +8,9 @@ and streams them to a client PC over TCP socket.
 """
 
 import argparse
+import os
 import select
+import signal
 import socket
 import struct
 import time
@@ -16,6 +18,8 @@ import time
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+
+from realsense_io import ButtonStatusServer
 
 
 def create_pipeline(width=640, height=480, fps=30, retries=4):
@@ -40,17 +44,21 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
             time.sleep(2.0)  # let the USB device fully release
             continue
 
-        # Get depth scale for later use
-        depth_sensor = profile.get_device().first_depth_sensor()
-        depth_scale = depth_sensor.get_depth_scale()
-        print(f"[INFO] Depth scale: {depth_scale:.6f} m/unit")
+        try:
+            # Get depth scale for later use
+            depth_sensor = profile.get_device().first_depth_sensor()
+            depth_scale = depth_sensor.get_depth_scale()
+            print(f"[INFO] Depth scale: {depth_scale:.6f} m/unit")
 
-        # Allow auto-exposure to settle (tolerate slow first frames)
-        for _ in range(30):
-            try:
-                pipeline.wait_for_frames(10000)
-            except RuntimeError:
-                pass
+            # Allow auto-exposure to settle (tolerate slow first frames)
+            for _ in range(30):
+                try:
+                    pipeline.wait_for_frames(10000)
+                except RuntimeError:
+                    pass
+        except BaseException:
+            pipeline.stop()
+            raise
 
         return pipeline
 
@@ -128,6 +136,13 @@ def get_color_intrinsics_blob(pipeline):
 def serve(host, port):
     """Main server loop."""
     pipeline = create_pipeline()
+    try:
+        _serve_pipeline(host, port, pipeline)
+    finally:
+        pipeline.stop()
+
+
+def _serve_pipeline(host, port, pipeline):
     align = rs.align(rs.stream.color)
     colorizer = rs.colorizer()
     intrinsics_blob = get_color_intrinsics_blob(pipeline)
@@ -239,7 +254,6 @@ def serve(host, port):
     except KeyboardInterrupt:
         print("\n[SERVER] Shutting down ...")
     finally:
-        pipeline.stop()
         server_sock.close()
 
 
@@ -248,7 +262,31 @@ if __name__ == '__main__':
         description='RealSense D435i stream server (Go2 docking station)')
     parser.add_argument('--host', default='0.0.0.0',
                         help='Bind address (default: 0.0.0.0)')
-    parser.add_argument('--port', type=int, default=128,
-                        help='TCP port (default: 128)')
+    parser.add_argument('--port', type=int, default=9999,
+                        help='TCP port (default: 9999)')
+    parser.add_argument('--status-port', type=int,
+                        default=int(os.environ.get('GO2_STATUS_PORT', 8765)),
+                        help='Independent button/LED WebSocket port (8765)')
+    parser.add_argument('--no-io', action='store_true',
+                        help='Camera only, for hosts without Raspberry Pi GPIO')
     args = parser.parse_args()
-    serve(args.host, args.port)
+
+    def shutdown_requested(signum, frame):
+        # TERM from the SSH stop script must run the same cleanup as Ctrl+C.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, shutdown_requested)
+    io_status = None
+    try:
+        if not args.no_io:
+            io_status = ButtonStatusServer(args.host, args.status_port)
+            io_status.start()
+        serve(args.host, args.port)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # A second signal must not interrupt LED/GPIO cleanup.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        if io_status is not None:
+            io_status.close()

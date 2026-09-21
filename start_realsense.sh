@@ -86,17 +86,29 @@ if [ "$SYNC_SERVER" = "true" ]; then
     # shellcheck disable=SC2086
     ${SSHPASS_CMD} scp ${SSH_OPTS} "$LOCAL_SERVER" \
         "${GO2_USER}@${GO2_IP}:${SERVER_PATH}"
+    # The camera server imports the local GPIO/WebSocket module.
+    ${SSHPASS_CMD} scp ${SSH_OPTS} "${SCRIPT_DIR}/realsense_io.py" \
+        "${GO2_USER}@${GO2_IP}:${SERVER_PATH%/*}/realsense_io.py"
     FORCE_RESTART=1   # code may have changed → restart even if already running
 fi
 
 # 1. (Re)start the server on the Go2.
 echo "[LAUNCH] Checking / starting server on Go2 ..."
 # shellcheck disable=SC2086
-$SSH bash -s -- "$SERVER_PATH" "$PORT" "$FORCE_RESTART" <<'REMOTE'
+$SSH bash -s -- "$SERVER_PATH" "$PORT" "$FORCE_RESTART" \
+    "$GO2_STATUS_PORT" "$GO2_CAMERA_IO" "$GO2_CAMERA_PYTHON" "$GO2_CAMERA_SUDO" <<'REMOTE'
 set -e
 SERVER_PATH="$1"
 PORT="$2"
 FORCE_RESTART="$3"
+STATUS_PORT="$4"
+ENABLE_IO="$5"
+CAMERA_PYTHON="$6"
+PRIVILEGE=()
+if [ "$7" = "true" ]; then
+    PRIVILEGE=(sudo -n)
+    sudo -n true || { echo "[ERROR] Noninteractive sudo is unavailable." >&2; exit 1; }
+fi
 
 port_listening() {
     # True only if something is actually bound+LISTENing on $PORT.
@@ -121,12 +133,16 @@ fi
 # replaced by freshly-synced code) and give the camera time to release.
 if server_running; then
     echo "[GO2] Stopping existing server process ..."
-    pkill -f "python.*realsense_server.py" 2>/dev/null || true
+    "${PRIVILEGE[@]}" pkill -TERM -f "python.*realsense_server.py" 2>/dev/null || true
     # Wait for the USB camera device to be fully released.
-    for _ in $(seq 1 10); do
+    for _ in $(seq 1 30); do
         server_running || break
         sleep 0.5
     done
+    if server_running; then
+        echo "[ERROR] Old server is still alive; refusing to open a second camera instance." >&2
+        exit 1
+    fi
     sleep 2   # extra settle so pipeline.start() doesn't hit a busy device
 fi
 
@@ -143,7 +159,10 @@ if [ -z "$SERVER_PATH" ] || [ ! -f "$SERVER_PATH" ]; then
 fi
 
 echo "[GO2] Starting server: $SERVER_PATH"
-nohup python3 "$SERVER_PATH" --port "$PORT" >/tmp/realsense_server.log 2>&1 &
+IO_ARGS=(--status-port "$STATUS_PORT")
+if [ "$ENABLE_IO" != "true" ]; then IO_ARGS+=(--no-io); fi
+nohup "${PRIVILEGE[@]}" "$CAMERA_PYTHON" -u "$SERVER_PATH" \
+    --port "$PORT" "${IO_ARGS[@]}" >/tmp/realsense_server.log 2>&1 &
 disown || true
 
 # Confirm it actually binds the port; surface the log if it doesn't.
@@ -182,4 +201,7 @@ if [ "$RUN_CLIENT" != "true" ]; then
 fi
 
 echo "[LAUNCH] Starting client ..."
-exec python3 "${SCRIPT_DIR}/realsense_client.py" --host "${GO2_IP}" --port "${PORT}"
+CLIENT_IO_ARGS=(--status-port "$GO2_STATUS_PORT")
+if [ "$GO2_CAMERA_IO" != "true" ]; then CLIENT_IO_ARGS+=(--no-io); fi
+exec python3 "${SCRIPT_DIR}/realsense_client.py" --host "${GO2_IP}" \
+    --port "${PORT}" "${CLIENT_IO_ARGS[@]}"
