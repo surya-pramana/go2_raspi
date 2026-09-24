@@ -36,6 +36,7 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
         config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
 
         try:
+            print(f"[STARTUP] Opening camera ({attempt}/{retries}) ...", flush=True)
             profile = pipeline.start(config)
         except RuntimeError as e:
             last_err = e
@@ -50,12 +51,8 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
             depth_scale = depth_sensor.get_depth_scale()
             print(f"[INFO] Depth scale: {depth_scale:.6f} m/unit")
 
-            # Allow auto-exposure to settle (tolerate slow first frames)
-            for _ in range(30):
-                try:
-                    pipeline.wait_for_frames(10000)
-                except RuntimeError:
-                    pass
+            # Read calibration before waiting for frames, matching the isolated
+            # calibration test. Do not silently swallow 30 ten-second timeouts.
         except BaseException:
             pipeline.stop()
             raise
@@ -137,15 +134,41 @@ def serve(host, port):
     """Main server loop."""
     pipeline = create_pipeline()
     try:
-        _serve_pipeline(host, port, pipeline)
+        print("[STARTUP] Reading RGB intrinsics ...", flush=True)
+        intrinsics_blob = get_color_intrinsics_blob(pipeline)
+        print("[STARTUP] RGB intrinsics ready.", flush=True)
+        warm_up_camera(pipeline)
+        _serve_pipeline(host, port, pipeline, intrinsics_blob)
     finally:
         pipeline.stop()
 
 
-def _serve_pipeline(host, port, pipeline):
+def warm_up_camera(pipeline, target_frames=30, timeout_seconds=10):
+    """Require 30 valid RGB/depth pairs within a bounded warm-up window."""
+    print(f"[STARTUP] Waiting for {target_frames} RGB/depth frames ...", flush=True)
+    deadline = time.monotonic() + timeout_seconds
+    count = 0
+    last_error = "No complete RGB/depth frames"
+    while count < target_frames:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Camera warm-up timed out: {count}/{target_frames} valid frames "
+                f"in {timeout_seconds}s. Last error: {last_error}")
+        try:
+            frames = pipeline.wait_for_frames(max(1, min(1000, int(remaining * 1000))))
+        except RuntimeError as exc:
+            last_error = str(exc)
+            print(f"[STARTUP][WARN] Frame wait: {exc}", flush=True)
+            continue
+        if frames.get_color_frame() and frames.get_depth_frame():
+            count += 1
+    print(f"[STARTUP] {count} RGB/depth frames received.", flush=True)
+
+
+def _serve_pipeline(host, port, pipeline, intrinsics_blob):
     align = rs.align(rs.stream.color)
     colorizer = rs.colorizer()
-    intrinsics_blob = get_color_intrinsics_blob(pipeline)
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
