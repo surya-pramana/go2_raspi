@@ -19,6 +19,8 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
+rs.log_to_console(rs.log_severity.debug)
+
 from realsense_io import ButtonStatusServer
 
 
