@@ -210,3 +210,11 @@ not a `pip install`.
 - `../go2_perception/camera_config.py` — the Python half of the shared config
 - `../../go2_backend/api/camera_runner.py` — how the operator GUI drives this
 - `../launch/apriltag_checkpoint_tcp.launch.py` — the usual consumer
+
+ssh
+sudo env PYTHONPATH=/home/sf-system/.local/lib/python3.10/site-packages \
+  /home/sf-system/neopixel-test/.venv/bin/python3 \
+  -u realsense_server.py --port 9999 --status-port 8765
+
+local
+.\.venv\Scripts\python.exe realsense_client.py --host 192.168.123.90 --port 9999 --status-port 8765
