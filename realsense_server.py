@@ -9,11 +9,14 @@ and streams them to a client PC over TCP socket.
 
 import argparse
 import os
+import platform
+from importlib.metadata import version, PackageNotFoundError
 import select
 import signal
 import socket
 import struct
 import time
+import threading
 
 import cv2
 import numpy as np
@@ -22,6 +25,7 @@ import pyrealsense2 as rs
 rs.log_to_console(rs.log_severity.debug)
 
 from realsense_io import ButtonStatusServer
+from research_metrics import ResourceSampler, encode_metrics
 
 
 def create_pipeline(width=640, height=480, fps=30, retries=4):
@@ -132,7 +136,7 @@ def get_color_intrinsics_blob(pipeline):
                        c[0], c[1], c[2], c[3], c[4])
 
 
-def serve(host, port):
+def serve(host, port, report_event=None):
     """Main server loop."""
     pipeline = create_pipeline()
     try:
@@ -140,7 +144,7 @@ def serve(host, port):
         intrinsics_blob = get_color_intrinsics_blob(pipeline)
         print("[STARTUP] RGB intrinsics ready.", flush=True)
         warm_up_camera(pipeline)
-        _serve_pipeline(host, port, pipeline, intrinsics_blob)
+        _serve_pipeline(host, port, pipeline, intrinsics_blob, report_event)
     finally:
         pipeline.stop()
 
@@ -168,9 +172,24 @@ def warm_up_camera(pipeline, target_frames=30, timeout_seconds=10):
     print(f"[STARTUP] {count} RGB/depth frames received.", flush=True)
 
 
-def _serve_pipeline(host, port, pipeline, intrinsics_blob):
+def _serve_pipeline(host, port, pipeline, intrinsics_blob, report_event=None):
     align = rs.align(rs.stream.color)
     colorizer = rs.colorizer()
+    resources = ResourceSampler()
+    device = pipeline.get_active_profile().get_device()
+    depth_scale = device.first_depth_sensor().get_depth_scale()
+    metadata = dict(configured_fps=pipeline.get_active_profile().get_stream(rs.stream.color).fps(),
+                    depth_scale=depth_scale, pi_os=platform.platform(),
+                    pi_kernel=platform.release(), pi_python=platform.python_version())
+    for key, info in [('camera_model', rs.camera_info.name),
+                      ('camera_serial', rs.camera_info.serial_number),
+                      ('camera_firmware', rs.camera_info.firmware_version)]:
+        if device.supports(info):
+            metadata[key] = device.get_info(info)
+    try:
+        metadata['sdk_version'] = version('pyrealsense2')
+    except PackageNotFoundError:
+        metadata['sdk_version'] = 'unknown'
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -190,6 +209,7 @@ def _serve_pipeline(host, port, pipeline, intrinsics_blob):
                 # Optional mode byte (b'C' = color-only). Legacy clients send
                 # nothing and get the full packet as before.
                 color_only = (read_mode_byte(conn) == b'C')
+                previous_frame_at = None
 
                 while True:
                     try:
@@ -198,8 +218,28 @@ def _serve_pipeline(host, port, pipeline, intrinsics_blob):
                         # Frame didn't arrive in time — log and keep going
                         # instead of crashing the whole server.
                         print(f"[SERVER] Frame wait failed: {e}; retrying")
+                        if report_event:
+                            report_event('camera_frame_timeout', str(e))
                         continue
+                    frame_at = time.monotonic()
+                    source_color = frames.get_color_frame()
+                    source_depth = frames.get_depth_frame()
+                    if not source_color or not source_depth:
+                        if report_event:
+                            report_event('incomplete_frameset', 'RGB or depth missing')
+                        continue
+                    metrics = dict(metadata)
+                    metrics.update(color_frame_id=source_color.get_frame_number(),
+                                   depth_frame_id=source_depth.get_frame_number(),
+                                   color_timestamp_ms=source_color.get_timestamp(),
+                                   depth_timestamp_ms=source_depth.get_timestamp(),
+                                   timestamp_domain=str(source_color.get_frame_timestamp_domain()),
+                                   pi_frame_interval_ms=((frame_at - previous_frame_at) * 1000
+                                                         if previous_frame_at is not None else None))
+                    previous_frame_at = frame_at
+                    alignment_started = time.monotonic()
                     aligned = align.process(frames)
+                    metrics['align_ms'] = (time.monotonic() - alignment_started) * 1000
 
                     color_frame = aligned.get_color_frame()
                     depth_frame = aligned.get_depth_frame()
@@ -238,6 +278,7 @@ def _serve_pipeline(host, port, pipeline, intrinsics_blob):
                         depth_raw_bytes = depth_raw_png.tobytes()
 
                     t_encoded = time.time()
+                    metrics.update(resources.sample())
 
                     # Build packet:
                     #   [t_capture(8d)] [t_encoded(8d)]
@@ -255,6 +296,7 @@ def _serve_pipeline(host, port, pipeline, intrinsics_blob):
                         + struct.pack('>I', len(depth_viz_bytes)) + depth_viz_bytes
                         + struct.pack('>I', len(depth_raw_bytes)) + depth_raw_bytes
                         + meta
+                        + encode_metrics(metrics)
                         # Colour intrinsics (9 floats, 36 B) appended LAST so the
                         # legacy viewer ignores them and the AprilTag detector can
                         # read them as packet[-36:]. See get_color_intrinsics_blob.
@@ -272,6 +314,8 @@ def _serve_pipeline(host, port, pipeline, intrinsics_blob):
                 # (or a client reconnect) still works.
                 import traceback
                 print(f"[SERVER] Unexpected error on {addr}: {e}")
+                if report_event:
+                    report_event('camera_processing_error', str(e))
                 traceback.print_exc()
             finally:
                 conn.close()
@@ -302,16 +346,34 @@ if __name__ == '__main__':
 
     signal.signal(signal.SIGTERM, shutdown_requested)
     io_status = None
+    telemetry_stop = threading.Event()
+    telemetry_thread = None
     try:
         if not args.no_io:
             io_status = ButtonStatusServer(args.host, args.status_port)
             io_status.start()
-        serve(args.host, args.port)
+            def sample_resources():
+                sampler = ResourceSampler()
+                while not telemetry_stop.is_set():
+                    io_status.update(resources=dict(sampler.sample(),
+                                                    resource_sample_id=time.monotonic_ns()))
+                    telemetry_stop.wait(1)
+            telemetry_thread = threading.Thread(target=sample_resources,
+                                                name='research-resources', daemon=True)
+            telemetry_thread.start()
+        def report_event(name, detail):
+            if io_status is not None:
+                io_status.update(camera_event=dict(id=time.monotonic_ns(),
+                                                   name=name, detail=detail))
+        serve(args.host, args.port, report_event)
     except KeyboardInterrupt:
         pass
     finally:
         # A second signal must not interrupt LED/GPIO cleanup.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
+        telemetry_stop.set()
+        if telemetry_thread is not None:
+            telemetry_thread.join(timeout=2)
         if io_status is not None:
             io_status.close()

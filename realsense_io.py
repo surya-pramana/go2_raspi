@@ -157,12 +157,13 @@ class ButtonStatusServer:
 
 class ButtonStatusClient:
     """Background reconnect; snapshot becomes unknown when heartbeat is stale."""
-    def __init__(self, host, port=8765):
+    def __init__(self, host, port=8765, on_event=None):
         self.url = f"ws://{host}:{port}/ws/status"
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.payload, self.received_at = None, 0
         self.ws = None
+        self.on_event = on_event
         self.thread = threading.Thread(target=self._run, daemon=True,
                                        name="button-status-client")
 
@@ -179,6 +180,8 @@ class ButtonStatusClient:
 
     def _run(self):
         from websockets.sync.client import connect
+        previous_camera_event = None
+        previous_resource_sample = None
         while not self.stop_event.is_set():
             try:
                 with connect(self.url, proxy=None, open_timeout=3,
@@ -186,6 +189,7 @@ class ButtonStatusClient:
                              max_size=16384) as ws:
                     with self.lock:
                         self.ws = ws
+                    connected = False
                     while not self.stop_event.is_set():
                         payload = json.loads(ws.recv(timeout=4))
                         if not isinstance(payload, dict) or "io_running" not in payload:
@@ -193,9 +197,24 @@ class ButtonStatusClient:
                         with self.lock:
                             self.payload = payload
                             self.received_at = time.monotonic()
+                        if self.on_event:
+                            if not connected:
+                                self.on_event('websocket_connected', self.url)
+                            camera_event = payload.get('camera_event')
+                            if camera_event and camera_event.get('id') != previous_camera_event:
+                                previous_camera_event = camera_event.get('id')
+                                self.on_event(camera_event.get('name', 'camera_error'),
+                                              camera_event.get('detail', ''))
+                            resources = payload.get('resources')
+                            if resources and resources.get('resource_sample_id') != previous_resource_sample:
+                                previous_resource_sample = resources.get('resource_sample_id')
+                                self.on_event('pi_resources', '', **resources)
+                        connected = True
             except Exception as exc:
                 if not self.stop_event.is_set():
                     print(f"[IO] Status unavailable: {exc}; reconnecting", flush=True)
+                    if self.on_event:
+                        self.on_event('websocket_unavailable', str(exc))
             finally:
                 with self.lock:
                     self.payload = None

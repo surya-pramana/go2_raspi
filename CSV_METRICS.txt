@@ -1,0 +1,71 @@
+Research CSV schema 2
+=====================
+Location remains ../../go2_benchmark/results relative to the client script.
+Each run creates camera_YYYYMMDD_HHMMSS_microseconds_uniqueID.csv. Existing files aren't
+rewritten or backfilled. Files are flushed after every row (not a power-loss guarantee).
+
+Filter row_type=frame for frame statistics. event rows record run/connection/error/
+freeze/IO transitions, metadata, and Pi resource snapshots. sample rows record
+one-second client rates even when video isn't arriving. Missing data is blank,
+not zero. event-only files are valid failed-run records.
+
+Original columns remain first. total_latency_ms/network_ms retain their old
+nonnegative estimates; raw_total_latency_ms/raw_network_ms preserve negative
+clock-sync estimates for diagnosis. Their origin is AFTER alignment on the Pi,
+and their endpoint is packet reception on the laptop, NOT physical display.
+encode_ms still covers the original pre-encode to post-encode interval.
+
+recv_monotonic_ns: local laptop monotonic reception timestamp; don't compare to
+Pi monotonic timestamps. recv_interval_ms: time between complete packet arrivals.
+receive_fps and payload_mbps: one-second receive rates (application payload only).
+fps: successfully decoded client-loop frame rate in the latest complete window.
+First-window rates remain blank until one second elapses. The GUI displays 0
+until a rate is available; the CSV doesn't treat that as a measured zero.
+queue_wait_ms: reception to start of processing (includes client queue delay).
+decode_ms: image parsing/decoding. client_processing_ms: dequeue through GUI
+submission and waitKey, excluding CSV writing. receive_to_gui_submit_ms includes
+queue delay, NOT monitor scanout or photon-to-screen latency.
+
+color/depth_frame_id: original sensor frame counters before alignment.
+color/depth_id_gap: positive counter gap between logged frames; not proof of
+network packet loss (acquisition, sampling and decode skips also contribute).
+*_id_reset indicates a backwards counter; first observation has no gap value.
+Sensor timestamps are milliseconds in timestamp_domain; do not subtract them
+from the laptop wall clock. pi_frame_interval_ms is the interval between server
+frameset retrievals in its sequential send loop, not sensor FPS in isolation.
+align_ms measures alignment processing. depth_scale is meters/raw depth unit.
+
+pi_process_cpu_pct: CPU time / elapsed time, 100% per busy core; can exceed 100.
+pi_system_cpu_pct: /proc/stat aggregate CPU use. pi_rss_mb: process resident MB.
+pi_temp_c: Linux thermal_zone0 (confirm this zone corresponds to the Pi CPU).
+Resources are cached for roughly one second; pi_resource_age_ms gives age at
+packet preparation. Separate pi_resources events arrive via WebSocket even if
+video stalls, while the Python threads and connection remain responsive.
+Unavailable OS sensors remain blank; throttling/undervoltage aren't measured.
+
+clock_offset_ms, sync_rtt_median_ms, sync_rtt_min_ms describe the initial clock
+handshake; clock_sync_age_s tracks its age. This isn't precision clock sync and
+isn't periodically recalibrated. RTT is measured using the client monotonic clock.
+
+--test-label names the experiment. --network-mode is an operator-entered label,
+not automatic network detection. --freeze-ms defaults to 2000: no new complete
+packet past that threshold records video_freeze_start, followed by an end event
+when packets resume. The event detail records the observed outage; the initial
+wait for first packet can also be classified as a freeze. TCP disconnection is
+recorded; automatic TCP reconnect is not added. WebSocket reconnects as before.
+
+Update realsense_server.py, realsense_io.py and research_metrics.py on the Pi.
+Update the client and modules on the laptop. start_realsense.sh deploys all three
+server modules. Optional RSM1 JSON telemetry is placed after h/w, BEFORE the
+last 36-byte intrinsics block. Legacy image parsing and packet[-36:] remain
+compatible. New clients accept old packets with blank server telemetry columns.
+No existing RGB/depth encoding, alignment or distance conversion is changed.
+
+Server camera errors are forwarded through latest-state WebSocket snapshots;
+rapid repeated events can coalesce and offline events aren't replayed. Keep the
+server debug log for exhaustive root-cause analysis. UI status transitions are
+observations, not acknowledgment of every physical button edge. GUI crashes or
+SIGKILL may prevent a run_end row.
+
+Legacy automatic report generation is disabled for this mixed-row schema.
+Filter row_type=frame before passing data to old analysis scripts.

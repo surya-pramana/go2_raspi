@@ -89,6 +89,8 @@ if [ "$SYNC_SERVER" = "true" ]; then
     # The camera server imports the local GPIO/WebSocket module.
     ${SSHPASS_CMD} scp ${SSH_OPTS} "${SCRIPT_DIR}/realsense_io.py" \
         "${GO2_USER}@${GO2_IP}:${SERVER_PATH%/*}/realsense_io.py"
+    ${SSHPASS_CMD} scp ${SSH_OPTS} "${SCRIPT_DIR}/research_metrics.py" \
+        "${GO2_USER}@${GO2_IP}:${SERVER_PATH%/*}/research_metrics.py"
     FORCE_RESTART=1   # code may have changed → restart even if already running
 fi
 

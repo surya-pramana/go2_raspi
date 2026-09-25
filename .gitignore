@@ -4,6 +4,9 @@
 .DS_Store
 Thumbs.db
 
+venv/
+.venv/
+
 # Python cache
 __pycache__/
 *.py[cod]

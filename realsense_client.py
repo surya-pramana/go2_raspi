@@ -20,19 +20,20 @@ Controls:
 """
 
 import argparse
-import csv
+import json
+import statistics
 import os
 import queue
 import socket
 import struct
 import time
 import threading
-from datetime import datetime
 
 import cv2
 import numpy as np
 
 from realsense_io import ButtonStatusClient
+from research_metrics import ResearchLogger, decode_metrics
 
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -61,18 +62,21 @@ def recv_frame(sock):
     return recv_exact(sock, length)
 
 
-def clock_sync(sock, rounds=10):
+def clock_sync(sock, rounds=10, return_metrics=False):
     """Estimate clock offset between client and server.
 
     Returns offset such that: server_time ≈ client_time + offset
     """
     offsets = []
+    rtts = []
     for _ in range(rounds):
         t1 = time.time()
+        m1 = time.monotonic()
         sock.sendall(struct.pack('>d', t1))  # ping
         srv_ts = struct.unpack('>d', recv_exact(sock, 8))[0]  # pong
         t2 = time.time()
-        rtt = t2 - t1
+        rtt = time.monotonic() - m1
+        rtts.append(rtt * 1000)
         # Estimate: server sent reply at ~midpoint of RTT
         offset = srv_ts - (t1 + rtt / 2.0)
         offsets.append(offset)
@@ -82,6 +86,10 @@ def clock_sync(sock, rounds=10):
     rtt_ms = (t2 - t1) * 1000
     print(f"[SYNC] Clock offset: {median_offset * 1000:.1f} ms, "
           f"last RTT: {rtt_ms:.1f} ms")
+    if return_metrics:
+        return median_offset, dict(clock_offset_ms=median_offset * 1000,
+                                   sync_rtt_median_ms=statistics.median(rtts),
+                                   sync_rtt_min_ms=min(rtts))
     return median_offset
 
 
@@ -256,57 +264,22 @@ def save_frames(color_img, depth_viz, depth_raw):
 # CSV latency logger
 # ─────────────────────────────────────────────────────────
 
-class LatencyLogger:
-    """Logs per-frame latency metrics to CSV (same dir as go2_benchmark results)."""
-
-    HEADER = [
-        'timestamp', 'elapsed_s', 'frame_num',
-        'total_latency_ms', 'encode_ms', 'network_ms',
-        'fps', 'packet_bytes', 'width', 'height',
-    ]
-
-    def __init__(self):
-        os.makedirs(RESULTS_DIR, exist_ok=True)
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.path = os.path.join(RESULTS_DIR, f'camera_{ts}.csv')
-        self._f = open(self.path, 'w', newline='')
-        self._writer = csv.writer(self._f)
-        self._writer.writerow(self.HEADER)
-        self._t0 = time.time()
-        self._frame = 0
-        print(f"[LOG] Recording to {self.path}")
-
-    def log(self, total_ms, encode_ms, net_ms, fps, pkt_bytes, w, h):
-        self._frame += 1
-        now = time.time()
-        self._writer.writerow([
-            datetime.now().isoformat(),
-            f'{now - self._t0:.3f}',
-            self._frame,
-            f'{total_ms:.2f}',
-            f'{encode_ms:.2f}',
-            f'{net_ms:.2f}',
-            f'{fps:.1f}',
-            pkt_bytes,
-            w, h,
-        ])
-        # Flush every 30 frames so data isn't lost on crash
-        if self._frame % 30 == 0:
-            self._f.flush()
-
-    def close(self):
-        self._f.close()
-        print(f"[LOG] Saved {self._frame} frames to {self.path}")
-        return self.path
+class LatencyLogger(ResearchLogger):
+    def __init__(self, **context):
+        super().__init__(RESULTS_DIR, **context)
 
 
 # ─────────────────────────────────────────────────────────
 # Main client
 # ─────────────────────────────────────────────────────────
 
-def run_client(host, port, status_port=8765, no_io=False):
+def run_client(host, port, status_port=8765, no_io=False,
+               test_label='', network_mode='unspecified', freeze_ms=2000):
     """Connect to server and display streams."""
     print(f"[CLIENT] Connecting to {host}:{port} ...")
+    logger = LatencyLogger(host=host, test_label=test_label,
+                           network_mode=network_mode, freeze_threshold_ms=freeze_ms)
+    logger.event('tcp_connecting', f'{host}:{port}')
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)
@@ -316,36 +289,67 @@ def run_client(host, port, status_port=8765, no_io=False):
     except (ConnectionRefusedError, OSError) as e:
         print(f"[ERROR] Cannot connect to {host}:{port} — {e}")
         print("        Is realsense_server.py running on the Go2?")
+        logger.event('tcp_connect_error', str(e))
+        sock.close()
+        logger.close()
         return
 
     sock.settimeout(10)
     print(f"[CLIENT] Connected!")
+    logger.event('tcp_connected')
 
     # Clock sync handshake
-    clock_offset = clock_sync(sock)
+    try:
+        clock_offset, sync_metrics = clock_sync(sock, return_metrics=True)
+    except Exception as exc:
+        logger.event('clock_sync_error', str(exc))
+        sock.close()
+        logger.close()
+        return
+    sync_at = time.monotonic()
+    logger.context.update(sync_metrics)
+    logger.event('clock_sync', json.dumps(sync_metrics))
 
     viewer = DepthViewer()
-    logger = LatencyLogger()
 
-    cv2.namedWindow("RealSense Color", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("RealSense Depth", cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback("RealSense Depth", viewer.mouse_cb)
-
-    io_status = None if no_io else ButtonStatusClient(host, status_port)
-    if io_status is not None:
-        io_status.start()
-        cv2.namedWindow("Button NC / NeoPixel", cv2.WINDOW_AUTOSIZE)
+    io_status = None if no_io else ButtonStatusClient(host, status_port, on_event=logger.event)
+    try:
+        cv2.namedWindow("RealSense Color", cv2.WINDOW_AUTOSIZE)
+        cv2.namedWindow("RealSense Depth", cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback("RealSense Depth", viewer.mouse_cb)
+        if io_status is not None:
+            io_status.start()
+            cv2.namedWindow("Button NC / NeoPixel", cv2.WINDOW_AUTOSIZE)
+    except Exception as exc:
+        logger.event('client_setup_error', str(exc))
+        if io_status is not None:
+            io_status.close()
+        sock.close()
+        cv2.destroyAllWindows()
+        logger.close()
+        raise
 
     # Receive TCP away from the GUI so a stalled camera cannot freeze IO status.
     packets = queue.Queue(maxsize=1)
     receiver_stop = threading.Event()
     receiver_error = []
+    rx_lock = threading.Lock()
+    rx = dict(last=None, count=0, byte_count=0)
 
     def receive_packets():
+        previous_ns = None
         try:
             while not receiver_stop.is_set():
                 packet = recv_frame(sock)
-                item = (packet, time.time())
+                received_wall, received_ns = time.time(), time.monotonic_ns()
+                interval = ((received_ns - previous_ns) / 1e6
+                            if previous_ns is not None else None)
+                previous_ns = received_ns
+                with rx_lock:
+                    rx['last'] = received_ns / 1e9
+                    rx['count'] += 1
+                    rx['byte_count'] += len(packet)
+                item = (packet, received_wall, received_ns, interval)
                 while not receiver_stop.is_set():
                     try:
                         packets.put(item, timeout=0.1)
@@ -355,27 +359,65 @@ def run_client(host, port, status_port=8765, no_io=False):
         except (OSError, ConnectionError) as exc:
             if not receiver_stop.is_set():
                 receiver_error.append(str(exc))
+                logger.event('tcp_disconnected', str(exc))
 
     receiver = threading.Thread(target=receive_packets, daemon=True)
     receiver.start()
 
-    fps = 0.0
+    fps = None
     frame_count = 0
-    t_start = time.time()
+    t_start = time.monotonic()
     latency_ms = 0.0
     encode_ms = 0.0
     net_ms = 0.0
     last_video = time.monotonic()
+    previous_count = previous_bytes = 0
+    receive_fps = payload_mbps = None
+    frozen = False
+    freeze_started = None
+    metadata_logged = False
+    previous_io = object()
 
     try:
         while True:
+            now = time.monotonic()
+            with rx_lock:
+                reception = dict(rx)
+            age = now - (reception['last'] if reception['last'] is not None else sync_at)
+            if age * 1000 >= freeze_ms and not frozen:
+                frozen = True
+                freeze_started = now - age
+                logger.event('video_freeze_start', f'no packet for {age * 1000:.1f} ms')
+            elif age * 1000 < freeze_ms and frozen:
+                logger.event('video_freeze_end',
+                             f'observed outage_ms={(now - freeze_started) * 1000:.1f}')
+                frozen = False
+            elapsed = now - t_start
+            if elapsed >= 1.0:
+                fps = frame_count / elapsed
+                receive_fps = (reception['count'] - previous_count) / elapsed
+                payload_mbps = (reception['byte_count'] - previous_bytes) * 8 / elapsed / 1e6
+                logger.write('sample', fps=fps, receive_fps=receive_fps,
+                             payload_mbps=payload_mbps,
+                             detail=f'last_packet_age_ms={age * 1000:.1f}',
+                             clock_sync_age_s=now - sync_at)
+                frame_count = 0
+                previous_count, previous_bytes = reception['count'], reception['byte_count']
+                t_start = now
             if io_status is not None:
-                draw_io_status(io_status.snapshot())
+                io = io_status.snapshot()
+                draw_io_status(io)
+                signature = (None if io is None else
+                             (io.get('session_id'), io.get('circuit_open'),
+                              io.get('led_commanded_color'), io.get('error'), io.get('io_running')))
+                if signature != previous_io:
+                    logger.event('io_status', json.dumps(io))
+                    previous_io = signature
             try:
-                packet, t_recv = packets.get(timeout=0.05)
+                packet, t_recv, received_ns, interval = packets.get(timeout=0.05)
             except queue.Empty:
                 # Clear stale video while keeping the independent status window live.
-                if receiver_error or time.monotonic() - last_video > 2:
+                if receiver_error or frozen:
                     blank = np.zeros((480, 640, 3), dtype=np.uint8)
                     label = "Camera disconnected" if receiver_error else "Waiting for video"
                     cv2.putText(blank, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX,
@@ -388,11 +430,21 @@ def run_client(host, port, status_port=8765, no_io=False):
                     break
                 continue
             last_video = time.monotonic()
-            color_img, depth_viz, depth_raw, h, w, t_capture, t_encoded = \
-                parse_packet(packet)
-
-            if color_img is None or depth_viz is None:
+            processing_started = time.monotonic_ns()
+            try:
+                metrics = decode_metrics(packet)
+                decode_started = time.monotonic_ns()
+                color_img, depth_viz, depth_raw, h, w, t_capture, t_encoded = parse_packet(packet)
+                decode_ms = (time.monotonic_ns() - decode_started) / 1e6
+                if color_img is None or depth_viz is None or depth_raw is None:
+                    raise ValueError('Invalid decoded RGB/depth image')
+            except Exception as exc:
+                logger.event('decode_error', str(exc), packet_bytes=len(packet),
+                             recv_monotonic_ns=received_ns)
                 continue
+            if not metadata_logged:
+                logger.event('server_metadata', metadata_json=json.dumps(metrics))
+                metadata_logged = True
 
             # Latency calculation (using clock offset)
             # Total: capture → client receive
@@ -401,35 +453,37 @@ def run_client(host, port, status_port=8765, no_io=False):
             encode_ms = (t_encoded - t_capture) * 1000
             # Network: after encoding → client receive
             net_ms = (t_recv - (t_encoded - clock_offset)) * 1000
+            raw_total, raw_network = latency_ms, net_ms
 
             # Clamp negatives from clock drift
             latency_ms = max(0.0, latency_ms)
             encode_ms = max(0.0, encode_ms)
             net_ms = max(0.0, net_ms)
 
-            # Log to CSV
-            logger.log(latency_ms, encode_ms, net_ms, fps,
-                        len(packet), w, h)
-
-            # FPS calculation
             frame_count += 1
-            elapsed = time.time() - t_start
-            if elapsed >= 1.0:
-                fps = frame_count / elapsed
-                frame_count = 0
-                t_start = time.time()
 
             # Render depth with custom colormap + distance
             depth_display = viewer.render_depth(depth_raw, depth_viz)
 
             # Add FPS + latency to both views
-            add_overlay(color_img, fps, latency_ms, encode_ms, net_ms)
-            add_overlay(depth_display, fps, latency_ms, encode_ms, net_ms)
+            add_overlay(color_img, fps or 0, latency_ms, encode_ms, net_ms)
+            add_overlay(depth_display, fps or 0, latency_ms, encode_ms, net_ms)
 
             cv2.imshow("RealSense Color", color_img)
             cv2.imshow("RealSense Depth", depth_display)
 
             key = cv2.waitKey(1) & 0xFF
+            gui_submitted = time.monotonic_ns()
+            metrics.update(total_latency_ms=latency_ms, encode_ms=encode_ms,
+                           network_ms=net_ms, raw_total_latency_ms=raw_total,
+                           raw_network_ms=raw_network, fps=fps, receive_fps=receive_fps,
+                           payload_mbps=payload_mbps, packet_bytes=len(packet), width=w, height=h,
+                           recv_monotonic_ns=received_ns, recv_interval_ms=interval,
+                           decode_ms=decode_ms, queue_wait_ms=(processing_started - received_ns) / 1e6,
+                           client_processing_ms=(gui_submitted - processing_started) / 1e6,
+                           receive_to_gui_submit_ms=(gui_submitted - received_ns) / 1e6,
+                           clock_sync_age_s=time.monotonic() - sync_at)
+            logger.write('frame', **metrics)
             if key in (ord('q'), 27):  # q or ESC
                 break
             elif key == ord('s'):
@@ -437,9 +491,11 @@ def run_client(host, port, status_port=8765, no_io=False):
             elif key == ord('d'):
                 viewer.next_colormap()
 
-    except ConnectionError:
-        print("[CLIENT] Server disconnected.")
+    except Exception as exc:
+        logger.event('client_error', f'{type(exc).__name__}: {exc}')
+        print(f"[CLIENT] Error: {exc}")
     except KeyboardInterrupt:
+        logger.event('user_interrupt')
         print("\n[CLIENT] Stopped.")
     finally:
         receiver_stop.set()
@@ -454,15 +510,9 @@ def run_client(host, port, status_port=8765, no_io=False):
         sock.close()
         cv2.destroyAllWindows()
 
-        # Generate visual report
-        print("[CLIENT] Generating latency report ...")
-        try:
-            from visualize_camera_latency import generate_report
-            report_path = generate_report(csv_path)
-            print(f"[CLIENT] Report: {report_path}")
-        except Exception as e:
-            print(f"[CLIENT] Could not generate report: {e}")
-            print(f"[CLIENT] Run manually: python3 visualize_camera_latency.py {csv_path}")
+        print(f"[LOG] Saved {logger.frames} frames and events to {csv_path}")
+        # Legacy report tools assume all rows are frames. Filter row_type=frame
+        # before using those tools with this expanded schema.
 
 
 def draw_io_status(status):
@@ -504,5 +554,13 @@ if __name__ == '__main__':
                         default=int(os.environ.get('GO2_STATUS_PORT', 8765)))
     parser.add_argument('--no-io', action='store_true',
                         help='Disable button/LED status window')
+    parser.add_argument('--test-label', default='', help='Experiment ID stored in CSV')
+    parser.add_argument('--network-mode', default='unspecified',
+                        help='Operator description, e.g. pi-lan_laptop-wifi')
+    parser.add_argument('--freeze-ms', type=float, default=2000,
+                        help='No-packet interval considered a freeze (default 2000 ms)')
     args = parser.parse_args()
-    run_client(args.host, args.port, args.status_port, args.no_io)
+    if args.freeze_ms <= 0:
+        parser.error('--freeze-ms must be positive')
+    run_client(args.host, args.port, args.status_port, args.no_io,
+               args.test_label, args.network_mode, args.freeze_ms)
