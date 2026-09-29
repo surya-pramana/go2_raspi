@@ -132,14 +132,37 @@ def get_color_intrinsics_blob(pipeline):
                        c[0], c[1], c[2], c[3], c[4])
 
 
+def get_color_intrinsics_blob_with_retry(pipeline, retries=4, delay=1.0):
+    """Read colour intrinsics after startup, retrying transient USB timeouts."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"[STARTUP] Reading RGB intrinsics "
+                  f"({attempt}/{retries}) ...", flush=True)
+            blob = get_color_intrinsics_blob(pipeline)
+            print("[STARTUP] RGB intrinsics ready.", flush=True)
+            return blob
+        except RuntimeError as exc:
+            last_error = exc
+            print(f"[STARTUP][WARN] Could not read RGB intrinsics: {exc}",
+                  flush=True)
+            if attempt < retries:
+                time.sleep(delay)
+
+    raise RuntimeError(
+        f"Could not read RGB intrinsics after {retries} attempts: "
+        f"{last_error}") from last_error
+
+
 def serve(host, port):
     """Main server loop."""
     pipeline = create_pipeline()
     try:
-        print("[STARTUP] Reading RGB intrinsics ...", flush=True)
-        intrinsics_blob = get_color_intrinsics_blob(pipeline)
-        print("[STARTUP] RGB intrinsics ready.", flush=True)
+        # Let both streams settle before issuing the UVC control query used by
+        # get_intrinsics(). Some ARM/USB combinations time out if queried
+        # immediately after pipeline.start().
         warm_up_camera(pipeline)
+        intrinsics_blob = get_color_intrinsics_blob_with_retry(pipeline)
         _serve_pipeline(host, port, pipeline, intrinsics_blob)
     finally:
         pipeline.stop()
