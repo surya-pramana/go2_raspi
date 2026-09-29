@@ -40,6 +40,8 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
         try:
             print(f"[STARTUP] Opening camera ({attempt}/{retries}) ...", flush=True)
             profile = pipeline.start(config)
+            for _ in range(30):
+                pipeline.wait_for_frames()
         except RuntimeError as e:
             last_err = e
             print(f"[WARN] pipeline.start failed "
