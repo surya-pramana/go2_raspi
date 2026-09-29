@@ -5,7 +5,9 @@
 Thumbs.db
 
 venv/
+cameraSDK
 .venv/
+debug_logs/
 
 # Python cache
 __pycache__/
