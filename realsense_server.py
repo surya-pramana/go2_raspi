@@ -154,6 +154,31 @@ def get_color_intrinsics_blob_with_retry(pipeline, retries=4, delay=1.0):
         f"{last_error}") from last_error
 
 
+def check_alignment_calibration(pipeline):
+    """Read alignment prerequisites separately so failures name the exact query."""
+    profile = pipeline.get_active_profile()
+    depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+    color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+
+    stage = 'depth intrinsics'
+    try:
+        print(f"[CHECK] Reading {stage} ...", flush=True)
+        depth_intrinsics = depth_profile.get_intrinsics()
+        print(f"[CHECK] Depth intrinsics OK: {depth_intrinsics}", flush=True)
+
+        stage = 'RGB intrinsics'
+        print(f"[CHECK] Reading {stage} ...", flush=True)
+        color_intrinsics = color_profile.get_intrinsics()
+        print(f"[CHECK] RGB intrinsics OK: {color_intrinsics}", flush=True)
+
+        stage = 'extrinsics depth -> RGB'
+        print(f"[CHECK] Reading {stage} ...", flush=True)
+        extrinsics = depth_profile.get_extrinsics_to(color_profile)
+        print(f"[CHECK] Extrinsics OK: {extrinsics}", flush=True)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Alignment calibration check failed at {stage}: {exc}") from exc
+
+
 def serve(host, port):
     """Main server loop."""
     pipeline = create_pipeline()
@@ -163,6 +188,7 @@ def serve(host, port):
         # immediately after pipeline.start().
         warm_up_camera(pipeline)
         intrinsics_blob = get_color_intrinsics_blob_with_retry(pipeline)
+        check_alignment_calibration(pipeline)
         _serve_pipeline(host, port, pipeline, intrinsics_blob)
     finally:
         pipeline.stop()
