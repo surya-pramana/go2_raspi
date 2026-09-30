@@ -59,6 +59,7 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
             # calibration test. Do not silently swallow 30 ten-second timeouts.
         except BaseException:
             pipeline.stop()
+            pipeline = None
             raise
 
         return pipeline
@@ -194,6 +195,7 @@ def serve(host, port):
         _serve_pipeline(host, port, pipeline, intrinsics_blob)
     finally:
         pipeline.stop()
+        pipeline = None
 
 
 def warm_up_camera(pipeline, target_frames=30, timeout_seconds=10):
