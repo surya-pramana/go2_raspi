@@ -9,6 +9,7 @@ and streams them to a client PC over TCP socket.
 
 import argparse
 import gc
+from logging import config
 import os
 import select
 import signal
@@ -40,7 +41,9 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
 
         try:
             print(f"[STARTUP] Opening camera ({attempt}/{retries}) ...", flush=True)
+            print("[DEBUG] before pipeline.start()")
             profile = pipeline.start(config)
+            print("[DEBUG] after pipeline.start()")
             # for _ in range(30):
             #     pipeline.wait_for_frames()
         except RuntimeError as e:
