@@ -8,6 +8,7 @@ and streams them to a client PC over TCP socket.
 """
 
 import argparse
+import gc
 import os
 import select
 import signal
@@ -59,10 +60,13 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
             # calibration test. Do not silently swallow 30 ten-second timeouts.
         except BaseException:
             try:
+                print(f"[BaseException] pipeline.stop camera", flush=True)
                 pipeline.stop()
             except:
                 pass
             pipeline = None
+            gc.collect()
+            time.sleep(2)
             raise
 
         return pipeline
@@ -202,6 +206,8 @@ def serve(host, port):
         except:
             pass
         pipeline = None
+        gc.collect()
+        time.sleep(2)
 
 
 def warm_up_camera(pipeline, target_frames=30, timeout_seconds=10):
