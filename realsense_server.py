@@ -46,9 +46,6 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
         pipeline = rs.pipeline()
         config = rs.config()
         profile = None
-        for dev in ctx.query_devices():
-            dev.hardware_reset()
-        
         time.sleep(5)
         config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
         config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
