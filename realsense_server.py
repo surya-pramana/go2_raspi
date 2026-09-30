@@ -66,7 +66,7 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
                 pass
             pipeline = None
             gc.collect()
-            time.sleep(2)
+            time.sleep(10)
             raise
 
         return pipeline
