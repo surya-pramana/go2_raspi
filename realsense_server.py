@@ -47,7 +47,7 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
             last_err = e
             print(f"[WARN] pipeline.start failed "
                   f"(attempt {attempt}/{retries}): {e}")
-            time.sleep(2.0)  # let the USB device fully release
+            time.sleep(10.0)  # let the USB device fully release
             continue
 
         try:
