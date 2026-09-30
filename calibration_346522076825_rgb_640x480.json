@@ -1,0 +1,15 @@
+{
+  "width": 640,
+  "height": 480,
+  "fps": 30,
+  "fx": 606.8045043945312,
+  "fy": 606.5745849609375,
+  "ppx": 323.5519714355469,
+  "ppy": 252.485595703125,
+  "coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "model": "distortion.inverse_brown_conrady",
+  "serial": "346522076825",
+  "stream": "color",
+  "pixel_format": "bgr8",
+  "provenance": "Previously successful SDK read supplied in user startup logs; 640x480 BGR8 30 FPS. Physical pose accuracy not yet validated."
+}

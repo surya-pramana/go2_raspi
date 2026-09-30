@@ -3,6 +3,7 @@ import struct
 import unittest
 import time
 import threading
+import tempfile
 import importlib.util
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,52 @@ CAL = dict(width=640, height=480, fx=600., fy=600., ppx=320., ppy=240.,
 
 
 class RGBPoseTests(unittest.TestCase):
+    def test_saved_calibration_skips_intrinsics_and_stops(self):
+        server = self.load_server()
+        path = Path(__file__).with_name('calibration_346522076825_rgb_640x480.json')
+        pipeline = MagicMock()
+        active = pipeline.get_active_profile.return_value
+        active.get_device.return_value.get_info.return_value = '346522076825'
+        profile = active.get_stream.return_value.as_video_stream_profile.return_value
+        profile.width.return_value = 640
+        profile.height.return_value = 480
+        profile.fps.return_value = 30
+        profile.format.return_value = server.rs.format.bgr8
+        with patch.object(server, 'create_pipeline', return_value=pipeline) as create, \
+             patch.object(server, 'warm_up_camera'), \
+             patch.object(server, 'read_rgb_calibration') as read, \
+             patch.object(server, 'LatestRGB') as capture, \
+             patch.object(server, '_serve_pipeline') as network:
+            server.serve('localhost', 9999, str(path))
+        create.assert_called_once_with(serial='346522076825')
+        read.assert_not_called()
+        profile.get_intrinsics.assert_not_called()
+        capture.return_value.start.assert_called_once()
+        capture.return_value.close.assert_called_once()
+        pipeline.stop.assert_called_once()
+        self.assertEqual(network.call_args.args[3]['calibration_source'], 'file')
+        active.get_device.return_value.get_info.return_value = 'other-camera'
+        with self.assertRaisesRegex(ValueError, 'serial mismatch'):
+            server.verify_saved_profile(pipeline, server.load_rgb_calibration(path))
+        active.get_device.return_value.get_info.return_value = '346522076825'
+        profile.width.return_value = 1280
+        with self.assertRaisesRegex(ValueError, 'profile'):
+            server.verify_saved_profile(pipeline, server.load_rgb_calibration(path))
+
+    def test_invalid_saved_calibration(self):
+        server = self.load_server()
+        original = json.loads(Path(__file__).with_name(
+            'calibration_346522076825_rgb_640x480.json').read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bad.json'
+            for changes in ({'fx': 0}, {'fx': float('nan')}, {'serial': ''},
+                            {'width': 1280}, {'fps': 15}, {'coeffs': [0]},
+                            {'coeffs': [.1, 0, 0, 0, 0]}, {'model': 'unknown'}):
+                with self.subTest(changes=changes):
+                    path.write_text(json.dumps(dict(original, **changes)))
+                    with self.assertRaises(ValueError):
+                        server.load_rgb_calibration(path)
+
     def load_server(self):
         spec = importlib.util.spec_from_file_location('capture_test_server',
                     Path(__file__).with_name('realsense_server.py'))

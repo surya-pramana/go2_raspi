@@ -26,10 +26,12 @@ import pyrealsense2 as rs
 from realsense_io import ButtonStatusServer
 
 
-def create_pipeline(width=640, height=480, fps=30):
+def create_pipeline(width=640, height=480, fps=30, serial=None):
     """Start RGB only. Fail once; do not reset/retry a failed native SDK session."""
     pipeline = rs.pipeline()
     config = rs.config()
+    if serial is not None:
+        config.enable_device(serial)
     config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
     print("[STARTUP] Opening RGB camera ...", flush=True)
     pipeline.start(config)
@@ -91,6 +93,50 @@ def read_rgb_calibration(pipeline):
                 ppx=intr.ppx, ppy=intr.ppy, coeffs=list(intr.coeffs),
                 model=str(intr.model), serial=profile.get_device().get_info(rs.camera_info.serial_number),
                 stream='color', pixel_format='bgr8', protocol_version=2)
+
+
+def load_rgb_calibration(path):
+    """Explicit saved calibration only; never fall back after a USB timeout."""
+    with open(path, encoding='utf-8') as source:
+        data = json.load(source)
+    if not isinstance(data, dict):
+        raise ValueError('Calibration must be a JSON object')
+    required = ('width', 'height', 'fx', 'fy', 'ppx', 'ppy', 'coeffs',
+                'model', 'serial', 'stream', 'pixel_format', 'fps')
+    if any(key not in data for key in required):
+        raise ValueError('Incomplete saved calibration')
+    if not isinstance(data['serial'], str) or not data['serial'].strip():
+        raise ValueError('Calibration requires a camera serial number')
+    if (data['width'], data['height'], data['fps'], data['stream'], data['pixel_format']) != (
+            640, 480, 30, 'color', 'bgr8'):
+        raise ValueError('Saved calibration must match RGB 640x480 BGR8 at 30 FPS')
+    if not isinstance(data['coeffs'], list) or len(data['coeffs']) != 5:
+        raise ValueError('Calibration requires five distortion coefficients')
+    values = [data[k] for k in ('fx', 'fy', 'ppx', 'ppy')] + data['coeffs']
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in values):
+        raise ValueError('Calibration values must be numbers')
+    if not np.isfinite(values).all() or data['fx'] <= 0 or data['fy'] <= 0:
+        raise ValueError('Invalid saved RGB intrinsics')
+    if not (0 <= data['ppx'] < data['width'] and 0 <= data['ppy'] < data['height']):
+        raise ValueError('Principal point outside image')
+    if data['model'] not in ('distortion.none', 'distortion.brown_conrady',
+                             'distortion.inverse_brown_conrady', 'distortion.modified_brown_conrady'):
+        raise ValueError('Unsupported saved distortion model')
+    if data['model'] != 'distortion.brown_conrady' and any(data['coeffs']):
+        raise ValueError('Nonzero distortion requires model conversion before pose estimation')
+    return dict(data, protocol_version=2, calibration_source='file')
+
+
+def verify_saved_profile(pipeline, calibration):
+    """Check identity/profile without querying intrinsics over USB."""
+    active = pipeline.get_active_profile()
+    serial = active.get_device().get_info(rs.camera_info.serial_number)
+    profile = active.get_stream(rs.stream.color).as_video_stream_profile()
+    if serial != calibration['serial']:
+        raise ValueError(f'Camera serial mismatch: {serial}')
+    if (profile.width(), profile.height(), profile.fps(), profile.format()) != (
+            calibration['width'], calibration['height'], calibration['fps'], rs.format.bgr8):
+        raise ValueError('Active RGB profile does not match saved calibration')
 
 
 class CameraCaptureError(RuntimeError):
@@ -177,13 +223,20 @@ class LatestRGB:
                                      'Check the process before restarting.')
 
 
-def serve(host, port):
-    pipeline = create_pipeline()
+def serve(host, port, calibration_file=None):
+    calibration = load_rgb_calibration(calibration_file) if calibration_file else None
+    pipeline = (create_pipeline(serial=calibration['serial']) if calibration is not None
+                else create_pipeline())
     capture = None
     try:
         warm_up_camera(pipeline)
-        print("[STARTUP] Reading RGB calibration ...", flush=True)
-        calibration = read_rgb_calibration(pipeline)
+        if calibration is None:
+            print("[STARTUP] Reading RGB calibration ...", flush=True)
+            calibration = read_rgb_calibration(pipeline)
+        else:
+            verify_saved_profile(pipeline, calibration)
+            print(f'[STARTUP] Saved RGB calibration verified: {calibration_file}; '
+                  'get_intrinsics() skipped.', flush=True)
         print(f"[CALIBRATION] {json.dumps(calibration)}", flush=True)
         capture = LatestRGB(pipeline)
         capture.start()
@@ -332,6 +385,8 @@ if __name__ == '__main__':
                         help='Independent button/LED WebSocket port (8765)')
     parser.add_argument('--no-io', action='store_true',
                         help='Camera only, for hosts without Raspberry Pi GPIO')
+    parser.add_argument('--calibration-file',
+                        help='Explicit saved RGB calibration; binds camera serial and skips get_intrinsics')
     args = parser.parse_args()
 
     def shutdown_requested(signum, frame):
@@ -344,7 +399,7 @@ if __name__ == '__main__':
         if not args.no_io:
             io_status = ButtonStatusServer(args.host, args.status_port)
             io_status.start()
-        serve(args.host, args.port)
+        serve(args.host, args.port, args.calibration_file)
     except KeyboardInterrupt:
         pass
     finally:
