@@ -205,12 +205,16 @@ def serve(host, port):
         _serve_pipeline(host, port, pipeline, intrinsics_blob)
     finally:
         try:
+            print(f"[try] pipeline.stop camera", flush=True)
             pipeline.stop()
         except:
+            print(f"[except try] pipeline.stop camera", flush=True)
             pass
         pipeline = None
+        print(f"[SERVER] shutdown", flush=True)
         gc.collect()
         time.sleep(2)
+        print(f"[SERVER] end", flush=True)
 
 
 def warm_up_camera(pipeline, target_frames=30, timeout_seconds=10):
