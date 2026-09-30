@@ -118,7 +118,7 @@ class LatestRGB:
         try:
             while not self.stop_event.is_set():
                 try:
-                    frames = self.pipeline.wait_for_frames(1000)
+                    frames = self.pipeline.wait_for_frames(5000)
                 except RuntimeError as exc:
                     if self.stop_event.is_set():
                         break
@@ -214,7 +214,7 @@ def warm_up_camera(pipeline, target_frames=30, timeout_seconds=10):
                 f"Camera warm-up timed out: {count}/{target_frames} valid frames "
                 f"in {timeout_seconds}s. Last error: {last_error}")
         try:
-            frames = pipeline.wait_for_frames(max(1, min(1000, int(remaining * 1000))))
+            frames = pipeline.wait_for_frames(max(1, min(5000, int(remaining * 1000))))
         except RuntimeError as exc:
             last_error = str(exc)
             print(f"[STARTUP][WARN] Frame wait: {exc}", flush=True)
