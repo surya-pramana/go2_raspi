@@ -3,13 +3,12 @@
 RealSense D435i Stream Server
 ==============================
 Runs on the Unitree Go2 docking station.
-Captures color + depth frames from Intel RealSense D435i
+Captures RGB frames only from Intel RealSense D435i
 and streams them to a client PC over TCP socket.
 """
 
 import argparse
-import gc
-from logging import config
+import json
 import os
 import select
 import signal
@@ -21,60 +20,20 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
-rs.log_to_console(rs.log_severity.debug)
+#rs.log_to_console(rs.log_severity.debug)
 
 from realsense_io import ButtonStatusServer
 
 
-def create_pipeline(width=640, height=480, fps=30, retries=4):
-    """Configure and start the RealSense D435i pipeline.
-
-    Retries on a busy/just-released camera (common right after the previous
-    server process was killed and restarted) instead of crashing.
-    """
-    last_err = None
-    for attempt in range(1, retries + 1):
-        pipeline = rs.pipeline()
-        config = rs.config()
-        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-
-        try:
-            print(f"[STARTUP] Opening camera ({attempt}/{retries}) ...", flush=True)
-            print("[DEBUG] before pipeline.start()")
-            profile = pipeline.start(config)
-            print(f"[DEBUG] start OK "f"({time.time()-t0:.2f}s)")
-            print("[DEBUG] after pipeline.start()")
-        except RuntimeError as e:
-            last_err = e
-            print(f"[WARN] pipeline.start failed "
-                  f"(attempt {attempt}/{retries}): {e}")
-            time.sleep(2.0)  # let the USB device fully release
-            continue
-
-        try:
-            # Get depth scale for later use
-            depth_sensor = profile.get_device().first_depth_sensor()
-            depth_scale = depth_sensor.get_depth_scale()
-            print(f"[INFO] Depth scale: {depth_scale:.6f} m/unit")
-
-            # Read calibration before waiting for frames, matching the isolated
-            # calibration test. Do not silently swallow 30 ten-second timeouts.
-        except BaseException:
-            try:
-                print(f"[BaseException] pipeline.stop camera", flush=True)
-                pipeline.stop()
-            except:
-                pass
-            pipeline = None
-            gc.collect()
-            time.sleep(2)
-            raise
-
-        return pipeline
-
-    raise RuntimeError(
-        f"Could not start RealSense pipeline after {retries} attempts: {last_err}")
+def create_pipeline(width=640, height=480, fps=30):
+    """Start RGB only. Fail once; do not reset/retry a failed native SDK session."""
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+    print("[STARTUP] Opening RGB camera ...", flush=True)
+    pipeline.start(config)
+    print("[STARTUP] RGB pipeline started.", flush=True)
+    return pipeline
 
 
 def recv_exact(conn, n):
@@ -107,13 +66,8 @@ def clock_sync_handshake(conn, rounds=10):
 def read_mode_byte(conn, timeout=0.5):
     """Optional post-handshake mode byte (backward compatible).
 
-    New clients may send ONE byte right after clock sync:
-        b'C' -> color-only mode: skip the depth-viz JPEG + raw-depth PNG encodes
-                entirely (they are ~80% of the per-frame bytes and the PNG is the
-                slowest encode on this ARM CPU). The packet keeps the SAME layout
-                but with zero-length depth fields, so parsers stay uniform.
-    Legacy clients (realsense_client.py) send nothing -> select() times out and
-    the server streams the full packet exactly as before.
+    Consume the legacy b'C' request if present. This branch always sends RGB
+    with empty depth fields, whether or not the client sends this byte.
     """
     ready, _, _ = select.select([conn], [], [], timeout)
     if not ready:
@@ -125,103 +79,42 @@ def read_mode_byte(conn, timeout=0.5):
     return mode
 
 
-def get_color_intrinsics_blob(pipeline):
-    """Pack the colour stream intrinsics as 9 big-endian floats:
-    fx, fy, ppx, ppy, k1, k2, p1, p2, k3.
-
-    Appended to every frame packet (see serve) so a downstream consumer that
-    needs camera calibration — e.g. the AprilTag detector's solvePnP — gets it
-    without a separate handshake. Appended at the END of the packet, so the
-    existing realsense_client.py viewer (which reads only up to the h,w meta and
-    ignores trailing bytes) is unaffected.
-    """
-    intr = (pipeline.get_active_profile()
-            .get_stream(rs.stream.color)
-            .as_video_stream_profile()
-            .get_intrinsics())
-    c = list(intr.coeffs[:5]) + [0.0] * 5
-    return struct.pack('>9f', intr.fx, intr.fy, intr.ppx, intr.ppy,
-                       c[0], c[1], c[2], c[3], c[4])
-
-
-def get_color_intrinsics_blob_with_retry(pipeline, retries=4, delay=1.0):
-    """Read colour intrinsics after startup, retrying transient USB timeouts."""
-    last_error = None
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"[STARTUP] Reading RGB intrinsics "
-                  f"({attempt}/{retries}) ...", flush=True)
-            blob = get_color_intrinsics_blob(pipeline)
-            print("[STARTUP] RGB intrinsics ready.", flush=True)
-            return blob
-        except RuntimeError as exc:
-            last_error = exc
-            print(f"[STARTUP][WARN] Could not read RGB intrinsics: {exc}",
-                  flush=True)
-            if attempt < retries:
-                time.sleep(delay)
-
-    raise RuntimeError(
-        f"Could not read RGB intrinsics after {retries} attempts: "
-        f"{last_error}") from last_error
-
-
-def check_alignment_calibration(pipeline):
-    """Read alignment prerequisites separately so failures name the exact query."""
+def read_rgb_calibration(pipeline):
+    """Read the actual active profile; never substitute guessed calibration."""
     profile = pipeline.get_active_profile()
-    depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
-    color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
-
-    stage = 'depth intrinsics'
-    try:
-        print(f"[CHECK] Reading {stage} ...", flush=True)
-        depth_intrinsics = depth_profile.get_intrinsics()
-        print(f"[CHECK] Depth intrinsics OK: {depth_intrinsics}", flush=True)
-
-        stage = 'RGB intrinsics'
-        print(f"[CHECK] Reading {stage} ...", flush=True)
-        color_intrinsics = color_profile.get_intrinsics()
-        print(f"[CHECK] RGB intrinsics OK: {color_intrinsics}", flush=True)
-
-        stage = 'extrinsics depth -> RGB'
-        print(f"[CHECK] Reading {stage} ...", flush=True)
-        extrinsics = depth_profile.get_extrinsics_to(color_profile)
-        print(f"[CHECK] Extrinsics OK: {extrinsics}", flush=True)
-    except RuntimeError as exc:
-        raise RuntimeError(f"Alignment calibration check failed at {stage}: {exc}") from exc
+    intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+    values = [intr.fx, intr.fy, intr.ppx, intr.ppy, *intr.coeffs]
+    if not np.isfinite(values).all() or intr.fx <= 0 or intr.fy <= 0:
+        raise RuntimeError("Invalid RGB calibration")
+    return dict(width=intr.width, height=intr.height, fx=intr.fx, fy=intr.fy,
+                ppx=intr.ppx, ppy=intr.ppy, coeffs=list(intr.coeffs),
+                model=str(intr.model), serial=profile.get_device().get_info(rs.camera_info.serial_number),
+                stream='color', pixel_format='bgr8', protocol_version=2)
 
 
 def serve(host, port):
-    """Main server loop."""
     pipeline = create_pipeline()
     try:
-        # Let both streams settle before issuing the UVC control query used by
-        # get_intrinsics(). Some ARM/USB combinations time out if queried
-        # immediately after pipeline.start().
         warm_up_camera(pipeline)
-        intrinsics_blob = get_color_intrinsics_blob_with_retry(pipeline)
-        check_alignment_calibration(pipeline)
-        _serve_pipeline(host, port, pipeline, intrinsics_blob)
+        print("[STARTUP] Reading RGB calibration ...", flush=True)
+        calibration = read_rgb_calibration(pipeline)
+        print(f"[CALIBRATION] {json.dumps(calibration)}", flush=True)
+        _serve_pipeline(host, port, pipeline, calibration)
     finally:
+        print("[SHUTDOWN] Stopping RGB pipeline ...", flush=True)
         try:
-            print(f"[try] pipeline.stop camera", flush=True)
             pipeline.stop()
-        except:
-            print(f"[except try] pipeline.stop camera", flush=True)
-            pass
-        pipeline = None
-        print(f"[SERVER] shutdown", flush=True)
-        gc.collect()
-        time.sleep(2)
-        print(f"[SERVER] end", flush=True)
+            print("[SHUTDOWN] RGB pipeline stopped.", flush=True)
+        except RuntimeError as exc:
+            print(f"[SHUTDOWN][ERROR] Camera stop failed: {exc}", flush=True)
 
 
 def warm_up_camera(pipeline, target_frames=30, timeout_seconds=10):
-    """Require 30 valid RGB/depth pairs within a bounded warm-up window."""
-    print(f"[STARTUP] Waiting for {target_frames} RGB/depth frames ...", flush=True)
+    """Require 30 valid RGB frames within a bounded warm-up window."""
+    print(f"[STARTUP] Waiting for {target_frames} RGB frames ...", flush=True)
     deadline = time.monotonic() + timeout_seconds
     count = 0
-    last_error = "No complete RGB/depth frames"
+    last_error = "No complete RGB frames"
     while count < target_frames:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -234,14 +127,17 @@ def warm_up_camera(pipeline, target_frames=30, timeout_seconds=10):
             last_error = str(exc)
             print(f"[STARTUP][WARN] Frame wait: {exc}", flush=True)
             continue
-        if frames.get_color_frame() and frames.get_depth_frame():
+        if frames.get_color_frame():
             count += 1
-    print(f"[STARTUP] {count} RGB/depth frames received.", flush=True)
+    print(f"[STARTUP] {count} RGB frames received.", flush=True)
 
 
-def _serve_pipeline(host, port, pipeline, intrinsics_blob):
-    align = rs.align(rs.stream.color)
-    colorizer = rs.colorizer()
+def _serve_pipeline(host, port, pipeline, calibration):
+    # Versioned metadata precedes the legacy 36-byte intrinsics trailer.
+    metadata = json.dumps(calibration, allow_nan=False).encode('utf-8')
+    calibration_blob = b'RGB2' + struct.pack('>I', len(metadata)) + metadata
+    intrinsics_blob = struct.pack('>9f', calibration['fx'], calibration['fy'],
+                                 calibration['ppx'], calibration['ppy'], *calibration['coeffs'])
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -256,11 +152,11 @@ def _serve_pipeline(host, port, pipeline, intrinsics_blob):
             print(f"[SERVER] Client connected: {addr}")
 
             try:
+                conn.settimeout(10)
                 # Clock sync handshake
                 clock_sync_handshake(conn)
-                # Optional mode byte (b'C' = color-only). Legacy clients send
-                # nothing and get the full packet as before.
-                color_only = (read_mode_byte(conn) == b'C')
+                # Consume an optional legacy color-only request.
+                read_mode_byte(conn)  # Retain the existing optional client handshake.
 
                 while True:
                     try:
@@ -270,12 +166,8 @@ def _serve_pipeline(host, port, pipeline, intrinsics_blob):
                         # instead of crashing the whole server.
                         print(f"[SERVER] Frame wait failed: {e}; retrying")
                         continue
-                    aligned = align.process(frames)
-
-                    color_frame = aligned.get_color_frame()
-                    depth_frame = aligned.get_depth_frame()
-
-                    if not color_frame or not depth_frame:
+                    color_frame = frames.get_color_frame()
+                    if not color_frame:
                         continue
 
                     t_capture = time.time()
@@ -284,29 +176,16 @@ def _serve_pipeline(host, port, pipeline, intrinsics_blob):
                     color_img = np.asanyarray(color_frame.get_data())
 
                     # Encode as JPEG for efficient transfer
-                    _, color_jpg = cv2.imencode(
+                    ok, color_jpg = cv2.imencode(
                         '.jpg', color_img,
                         [cv2.IMWRITE_JPEG_QUALITY, 80])
 
-                    if color_only:
-                        # Color-only mode: no depth encode at all. The uint16
-                        # PNG below is the slowest step on this CPU and ~80% of
-                        # the packet bytes — skipping it is the whole point.
-                        depth_viz_bytes = b''
-                        depth_raw_bytes = b''
-                    else:
-                        # Depth image — colorized for visualization
-                        depth_colorized = np.asanyarray(
-                            colorizer.colorize(depth_frame).get_data())
-                        # Raw depth (uint16, millimeters) for client-side use
-                        depth_raw = np.asanyarray(depth_frame.get_data())
-                        _, depth_viz_jpg = cv2.imencode(
-                            '.jpg', depth_colorized,
-                            [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        # Compress raw depth with PNG (lossless for uint16)
-                        _, depth_raw_png = cv2.imencode('.png', depth_raw)
-                        depth_viz_bytes = depth_viz_jpg.tobytes()
-                        depth_raw_bytes = depth_raw_png.tobytes()
+                    if not ok:
+                        raise RuntimeError("JPEG encoding failed")
+                    if color_img.shape[:2] != (calibration['height'], calibration['width']):
+                        raise RuntimeError("Frame dimensions differ from calibration")
+                    depth_viz_bytes = b''
+                    depth_raw_bytes = b''
 
                     t_encoded = time.time()
 
@@ -326,9 +205,8 @@ def _serve_pipeline(host, port, pipeline, intrinsics_blob):
                         + struct.pack('>I', len(depth_viz_bytes)) + depth_viz_bytes
                         + struct.pack('>I', len(depth_raw_bytes)) + depth_raw_bytes
                         + meta
-                        # Colour intrinsics (9 floats, 36 B) appended LAST so the
-                        # legacy viewer ignores them and the AprilTag detector can
-                        # read them as packet[-36:]. See get_color_intrinsics_blob.
+                        # Full model/resolution metadata, then the legacy trailer.
+                        + calibration_blob
                         + intrinsics_blob
                     )
 

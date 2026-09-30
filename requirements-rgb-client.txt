@@ -1,0 +1,4 @@
+# Install into a clean laptop environment; do not combine OpenCV wheel variants.
+numpy>=1.24,<3
+opencv-contrib-python>=4.8,<5
+websockets>=15,<16

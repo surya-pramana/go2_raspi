@@ -1,0 +1,53 @@
+RGB-only branch testing/02
+=========================
+Pi: realsense_server.py captures BGR8 640x480 at 30 FPS. No depth sensor,
+alignment, depth calibration, or depth scale is requested. GPIO17 NC and
+GPIO18 NeoPixel status remain in realsense_io.py. --no-io disables them.
+This reduces camera work; it does not guarantee recovery from USB/SDK faults.
+
+Laptop: install requirements-rgb-client.txt in a fresh environment, then:
+python realsense_client.py --host PI_IP --tag-size-m 0.10 --tag-family 36h11
+0.10 is an EXAMPLE: measure your printed tag's outer black square, excluding
+the surrounding white margin. All tags processed in a run must have that size.
+Omit --tag-size-m to view RGB without estimating pose. q or Escape stops the viewer.
+Only one TCP client is served at a time. Deploy updated server AND client.
+
+Calibration is read from the active RGB profile and sent on each frame:
+width, height, fx, fy, ppx, ppy, model, coeffs, serial, protocol_version.
+Images are neither resized nor cropped. Missing/invalid calibration fails
+startup rather than substituting zeros. The client rejects mismatched sizes
+for pose. Native Brown-Conrady is accepted; inverse/modified Brown-Conrady
+is accepted only if all coefficients are zero. Other models are rejected.
+Reference: https://dev.realsenseai.com/docs/projection-in-realsense-sdk-2-0/
+
+Wire layout: existing timestamps + JPEG + two zero-length depth fields + h,w,
+then ASCII RGB2 + big-endian uint32 JSON length + UTF-8 calibration JSON,
+then the existing 9 big-endian float intrinsics trailer. Older depth viewers
+must be updated. Consumers reading only the last 36 bytes cannot validate
+the distortion model and should migrate to the JSON metadata.
+
+Pose: OpenCV AprilTag dictionary detection and SOLVEPNP_IPPE_SQUARE.
+The transform maps tag coordinates to camera coordinates (camera x right,
+y down, z forward). Translation is metres. Rotation is a Rodrigues vector
+in radians, NOT Euler angles. range_m is Euclidean distance to tag centre;
+z_m is optical-axis depth. Planar markers can have two plausible solutions:
+the lowest reprojection error is chosen, both error values are logged.
+A small reprojection error alone does not prove physical accuracy.
+Reference: https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html
+
+Results: existing camera_*.csv performance log plus *_pose.csv and
+*_calibration.json in the same results directory printed by the client.
+Pose CSV contains accepted detections only; no detection means no pose row.
+No stale pose is reused. Performance latency starts after frame retrieval;
+it excludes sensor exposure/USB acquisition and pose processing/display.
+
+Physical validation (not yet performed by this implementation):
+1. Record printed tag size, tag ID/family, camera serial, lighting and resolution.
+2. Fix the tag and camera. Measure optical-centre to tag-centre range in metres.
+3. Run e.g. --tag-size-m 0.10 --reference-tag-id 0 --reference-range-m 1.0
+   Replace both example measurements with actual values. Keep geometry fixed.
+4. Repeat at several ranges and angles, with a separate run per reference.
+5. Report mean absolute error, bias, standard deviation and detection failures.
+   For full orientation validation use an independently measured angle/fixture;
+   the range reference does not validate rotation or camera-to-robot extrinsics.
+6. Test stop/restart and a 15-minute streaming run on the physical Pi.

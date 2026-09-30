@@ -6,8 +6,8 @@ Runs on your PC.
 Connects to the realsense_server.py host (the machine the camera is plugged
 into — the Go2's CPU, or a Raspberry Pi) and displays:
   - Color view (normal camera)
-  - Depth view (colorized depth map)
-  - Depth with distance info (hover mouse for distance)
+  - Optional AprilTag pose from RGB calibration and measured tag size
+  - Optional legacy depth view when connecting to an older depth server
 
 Usage:
     python3 realsense_client.py                      # uses GO2_CAMERA_HOST
@@ -21,6 +21,7 @@ Controls:
 
 import argparse
 import csv
+import json
 import os
 import queue
 import socket
@@ -58,6 +59,8 @@ def recv_frame(sock):
     """Receive one frame packet (4-byte length header + payload)."""
     header = recv_exact(sock, 4)
     length = struct.unpack('>I', header)[0]
+    if length > 32 * 1024 * 1024 or length < 32:
+        raise ValueError('Invalid camera packet length')
     return recv_exact(sock, length)
 
 
@@ -86,7 +89,7 @@ def clock_sync(sock, rounds=10):
 
 
 def parse_packet(packet):
-    """Parse a packet into color, depth_viz, depth_raw images + timestamps."""
+    """Parse RGB, optional legacy depth, timestamps and versioned calibration."""
     offset = 0
 
     # Server timestamps (capture time, encode-done time)
@@ -114,14 +117,24 @@ def parse_packet(packet):
     # Metadata
     h, w = struct.unpack('>HH', packet[offset:offset + 4])
 
+    offset += 4
+    calibration = None
+    if packet[offset:offset + 4] == b'RGB2':
+        size = struct.unpack('>I', packet[offset + 4:offset + 8])[0]
+        if size > 65536 or len(packet) != offset + 8 + size + 36:
+            raise ValueError('Invalid RGB calibration trailer')
+        calibration = json.loads(packet[offset + 8:offset + 8 + size])
+
     color_img = cv2.imdecode(
         np.frombuffer(color_jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
     depth_viz = cv2.imdecode(
-        np.frombuffer(depth_viz_jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        np.frombuffer(depth_viz_jpg, dtype=np.uint8), cv2.IMREAD_COLOR) if depth_viz_len else None
     depth_raw = cv2.imdecode(
-        np.frombuffer(depth_raw_png, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        np.frombuffer(depth_raw_png, dtype=np.uint8), cv2.IMREAD_UNCHANGED) if depth_raw_len else None
 
-    return color_img, depth_viz, depth_raw, h, w, t_capture, t_encoded
+    if color_img is None or color_img.shape[:2] != (h, w):
+        raise ValueError('Invalid RGB image dimensions')
+    return color_img, depth_viz, depth_raw, h, w, t_capture, t_encoded, calibration
 
 
 # ─────────────────────────────────────────────────────────
@@ -246,7 +259,8 @@ def save_frames(color_img, depth_viz, depth_raw):
     """Save current frames to disk."""
     ts = time.strftime("%Y%m%d_%H%M%S")
     cv2.imwrite(f"color_{ts}.png", color_img)
-    cv2.imwrite(f"depth_viz_{ts}.png", depth_viz)
+    if depth_viz is not None:
+        cv2.imwrite(f"depth_viz_{ts}.png", depth_viz)
     if depth_raw is not None:
         cv2.imwrite(f"depth_raw_{ts}.png", depth_raw)
     print(f"[SAVED] color_{ts}.png, depth_viz_{ts}.png, depth_raw_{ts}.png")
@@ -304,10 +318,15 @@ class LatencyLogger:
 # Main client
 # ─────────────────────────────────────────────────────────
 
-def run_client(host, port, status_port=8765, no_io=False):
+def run_client(host, port, status_port=8765, no_io=False, tag_size_m=None,
+               tag_family="36h11", reference_range_m=None, reference_tag_id=None):
     """Connect to server and display streams."""
     print(f"[CLIENT] Connecting to {host}:{port} ...")
 
+    pose_detector = None
+    if tag_size_m is not None:
+        from apriltag_pose import AprilTagPose
+        pose_detector = AprilTagPose(tag_size_m, tag_family)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)
 
@@ -326,10 +345,18 @@ def run_client(host, port, status_port=8765, no_io=False):
 
     viewer = DepthViewer()
     logger = LatencyLogger()
+    pose_file = None
+    if pose_detector is not None:
+        pose_file = open(logger.path.replace('.csv', '_pose.csv'), 'w', newline='')
+        pose_writer = csv.writer(pose_file)
+        pose_writer.writerow(['timestamp', 'tag_id', 'tag_size_m', 'x_m', 'y_m', 'z_m',
+                              'range_m', 'rx_rad', 'ry_rad', 'rz_rad', 'reprojection_px',
+                              'second_error_px', 'reference_range_m', 'range_error_m'])
+    calibration_saved = None
+    pose_error = None
 
     cv2.namedWindow("RealSense Color", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("RealSense Depth", cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback("RealSense Depth", viewer.mouse_cb)
+
 
     io_status = None if no_io else ButtonStatusClient(host, status_port)
     if io_status is not None:
@@ -352,7 +379,7 @@ def run_client(host, port, status_port=8765, no_io=False):
                         break
                     except queue.Full:
                         pass
-        except (OSError, ConnectionError) as exc:
+        except (OSError, ConnectionError, ValueError) as exc:
             if not receiver_stop.is_set():
                 receiver_error.append(str(exc))
 
@@ -381,18 +408,40 @@ def run_client(host, port, status_port=8765, no_io=False):
                     cv2.putText(blank, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.7, (0, 165, 255), 2)
                     cv2.imshow("RealSense Color", blank)
-                    cv2.imshow("RealSense Depth", blank)
+
                 if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
                     break
                 if receiver_error and no_io:
                     break
                 continue
             last_video = time.monotonic()
-            color_img, depth_viz, depth_raw, h, w, t_capture, t_encoded = \
+            color_img, depth_viz, depth_raw, h, w, t_capture, t_encoded, calibration = \
                 parse_packet(packet)
 
-            if color_img is None or depth_viz is None:
-                continue
+            if calibration is not None and calibration != calibration_saved:
+                with open(logger.path.replace('.csv', '_calibration.json'), 'w') as out:
+                    json.dump(calibration, out, indent=2, allow_nan=False)
+                calibration_saved = calibration
+            if pose_detector is not None:
+                try:
+                    if calibration is None:
+                        raise ValueError('Server does not provide distortion model; pose disabled')
+                    poses = pose_detector.process(color_img, calibration)
+                    pose_error = None
+                    for pose in poses:
+                        reference = reference_range_m if pose['tag_id'] == reference_tag_id else None
+                        pose_writer.writerow([datetime.now().isoformat(), pose['tag_id'], tag_size_m,
+                            *pose['tvec'], pose['range_m'], *pose['rvec'], pose['reprojection_px'],
+                            pose['second_error_px'], reference,
+                            pose['range_m'] - reference if reference is not None else None])
+                    pose_file.flush()
+                except (ValueError, KeyError) as exc:
+                    if pose_error != str(exc):
+                        print(f'[POSE] {exc}')
+                    pose_error = str(exc)
+                if pose_error:
+                    cv2.putText(color_img, 'Pose unavailable: check calibration', (10, h - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 0, 255), 1)
 
             # Latency calculation (using clock offset)
             # Total: capture → client receive
@@ -424,10 +473,12 @@ def run_client(host, port, status_port=8765, no_io=False):
 
             # Add FPS + latency to both views
             add_overlay(color_img, fps, latency_ms, encode_ms, net_ms)
-            add_overlay(depth_display, fps, latency_ms, encode_ms, net_ms)
+            if depth_display is not None:
+                add_overlay(depth_display, fps, latency_ms, encode_ms, net_ms)
 
             cv2.imshow("RealSense Color", color_img)
-            cv2.imshow("RealSense Depth", depth_display)
+            if depth_display is not None:
+                cv2.imshow("RealSense Depth", depth_display)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), 27):  # q or ESC
@@ -450,6 +501,8 @@ def run_client(host, port, status_port=8765, no_io=False):
         receiver.join(timeout=2)
         if io_status is not None:
             io_status.close()
+        if pose_file is not None:
+            pose_file.close()
         csv_path = logger.close()
         sock.close()
         cv2.destroyAllWindows()
@@ -504,5 +557,15 @@ if __name__ == '__main__':
                         default=int(os.environ.get('GO2_STATUS_PORT', 8765)))
     parser.add_argument('--no-io', action='store_true',
                         help='Disable button/LED status window')
+    parser.add_argument('--tag-size-m', type=float, help='Measured outer black tag edge in metres; enables pose')
+    parser.add_argument('--tag-family', choices=['16h5', '25h9', '36h10', '36h11'], default='36h11')
+    parser.add_argument('--reference-range-m', type=float, help='Measured camera optical centre to tag centre distance')
+    parser.add_argument('--reference-tag-id', type=int, help='Tag whose measured range is being validated')
     args = parser.parse_args()
-    run_client(args.host, args.port, args.status_port, args.no_io)
+    if args.reference_range_m is not None:
+        if not np.isfinite(args.reference_range_m) or args.reference_range_m <= 0:
+            parser.error('--reference-range-m must be positive')
+        if args.tag_size_m is None or args.reference_tag_id is None:
+            parser.error('Reference measurement requires --tag-size-m and --reference-tag-id')
+    run_client(args.host, args.port, args.status_port, args.no_io,
+               args.tag_size_m, args.tag_family, args.reference_range_m, args.reference_tag_id)
