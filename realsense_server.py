@@ -40,8 +40,8 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
         try:
             print(f"[STARTUP] Opening camera ({attempt}/{retries}) ...", flush=True)
             profile = pipeline.start(config)
-            for _ in range(30):
-                pipeline.wait_for_frames()
+            # for _ in range(30):
+            #     pipeline.wait_for_frames()
         except RuntimeError as e:
             last_err = e
             print(f"[WARN] pipeline.start failed "
@@ -58,7 +58,10 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
             # Read calibration before waiting for frames, matching the isolated
             # calibration test. Do not silently swallow 30 ten-second timeouts.
         except BaseException:
-            pipeline.stop()
+            try:
+                pipeline.stop()
+            except:
+                pass
             pipeline = None
             raise
 
@@ -194,7 +197,10 @@ def serve(host, port):
         check_alignment_calibration(pipeline)
         _serve_pipeline(host, port, pipeline, intrinsics_blob)
     finally:
-        pipeline.stop()
+        try:
+            pipeline.stop()
+        except:
+            pass
         pipeline = None
 
 
