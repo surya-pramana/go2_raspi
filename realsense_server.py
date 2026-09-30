@@ -33,20 +33,9 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
     server process was killed and restarted) instead of crashing.
     """
     last_err = None
-    ctx = rs.context()
     for attempt in range(1, retries + 1):
-        if attempt > 1:
-            try:
-                print("[INFO] Hardware reset camera")
-                for dev in ctx.query_devices():
-                    dev.hardware_reset()
-                time.sleep(8)
-            except Exception as e:
-                print(f"[WARN] hardware_reset failed: {e}")
         pipeline = rs.pipeline()
         config = rs.config()
-        profile = None
-        time.sleep(5)
         config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
         config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
 
@@ -56,8 +45,6 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
             profile = pipeline.start(config)
             print(f"[DEBUG] start OK "f"({time.time()-t0:.2f}s)")
             print("[DEBUG] after pipeline.start()")
-            # for _ in range(30):
-            #     pipeline.wait_for_frames()
         except RuntimeError as e:
             last_err = e
             print(f"[WARN] pipeline.start failed "
@@ -74,11 +61,6 @@ def create_pipeline(width=640, height=480, fps=30, retries=4):
             # Read calibration before waiting for frames, matching the isolated
             # calibration test. Do not silently swallow 30 ten-second timeouts.
         except BaseException:
-            try:
-                if profile is not None:
-                    profile.get_device().hardware_reset()
-            except Exception as e:
-                print(e)
             try:
                 print(f"[BaseException] pipeline.stop camera", flush=True)
                 pipeline.stop()
