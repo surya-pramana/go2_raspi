@@ -14,6 +14,7 @@ import select
 import signal
 import socket
 import struct
+import threading
 import time
 
 import cv2
@@ -92,15 +93,106 @@ def read_rgb_calibration(pipeline):
                 stream='color', pixel_format='bgr8', protocol_version=2)
 
 
+class CameraCaptureError(RuntimeError):
+    """Fatal capture failure, distinct from a disconnected network client."""
+
+
+class LatestRGB:
+    """One-slot buffer: camera reads never wait for TCP or JPEG encoding."""
+
+    def __init__(self, pipeline, failure_seconds=10):
+        self.pipeline = pipeline
+        self.failure_seconds = failure_seconds
+        self.stop_event = threading.Event()
+        self.condition = threading.Condition()
+        self.latest = None
+        self.sequence = 0
+        self.error = None
+        self.thread = threading.Thread(target=self._capture, name='rgb-capture')
+
+    def start(self):
+        self.thread.start()
+
+    def _capture(self):
+        last_frame = time.monotonic()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    frames = self.pipeline.wait_for_frames(1000)
+                except RuntimeError as exc:
+                    if self.stop_event.is_set():
+                        break
+                    if time.monotonic() - last_frame >= self.failure_seconds:
+                        raise CameraCaptureError(f'No RGB frames for {self.failure_seconds}s: {exc}') from exc
+                    continue
+                color = frames.get_color_frame()
+                if not color:
+                    if time.monotonic() - last_frame >= self.failure_seconds:
+                        raise CameraCaptureError('Frames received without RGB')
+                    continue
+                captured_at = time.time()
+                # Own the pixels: no SDK frame references escape this thread.
+                image = np.asanyarray(color.get_data()).copy()
+                del color, frames
+                last_frame = time.monotonic()
+                with self.condition:
+                    self.sequence += 1
+                    self.latest = (self.sequence, image, captured_at, last_frame)
+                    self.condition.notify_all()
+        except Exception as exc:
+            with self.condition:
+                self.error = str(exc)
+            print(f'[CAMERA][ERROR] {exc}', flush=True)
+        finally:
+            self.stop_event.set()
+            with self.condition:
+                self.condition.notify_all()
+
+    def check(self):
+        with self.condition:
+            if self.error is not None:
+                raise CameraCaptureError(self.error)
+            if self.stop_event.is_set():
+                raise CameraCaptureError('Capture stopped')
+
+    def next_frame(self, previous_sequence, timeout=1):
+        with self.condition:
+            self.condition.wait_for(lambda: self.sequence > previous_sequence
+                                    or self.stop_event.is_set(), timeout)
+            self.check()
+            if self.latest is None or self.sequence <= previous_sequence:
+                return None
+            # Do not send an old cached image to a newly connected client.
+            if time.monotonic() - self.latest[3] > 2:
+                return None
+            return self.latest[:3]
+
+    def close(self):
+        self.stop_event.set()
+        with self.condition:
+            self.condition.notify_all()
+        self.thread.join(timeout=7)
+        if self.thread.is_alive():
+            raise CameraCaptureError('Capture thread still inside SDK; pipeline.stop was not called concurrently. '
+                                     'Check the process before restarting.')
+
+
 def serve(host, port):
     pipeline = create_pipeline()
+    capture = None
     try:
         warm_up_camera(pipeline)
         print("[STARTUP] Reading RGB calibration ...", flush=True)
         calibration = read_rgb_calibration(pipeline)
         print(f"[CALIBRATION] {json.dumps(calibration)}", flush=True)
-        _serve_pipeline(host, port, pipeline, calibration)
+        capture = LatestRGB(pipeline)
+        capture.start()
+        print('[CAMERA] Continuous RGB capture thread started.', flush=True)
+        _serve_pipeline(host, port, capture, calibration)
     finally:
+        # Never stop the SDK while the capture thread is reading it.
+        if capture is not None:
+            capture.close()
         print("[SHUTDOWN] Stopping RGB pipeline ...", flush=True)
         try:
             pipeline.stop()
@@ -132,7 +224,7 @@ def warm_up_camera(pipeline, target_frames=30, timeout_seconds=10):
     print(f"[STARTUP] {count} RGB frames received.", flush=True)
 
 
-def _serve_pipeline(host, port, pipeline, calibration):
+def _serve_pipeline(host, port, capture, calibration):
     # Versioned metadata precedes the legacy 36-byte intrinsics trailer.
     metadata = json.dumps(calibration, allow_nan=False).encode('utf-8')
     calibration_blob = b'RGB2' + struct.pack('>I', len(metadata)) + metadata
@@ -143,12 +235,17 @@ def _serve_pipeline(host, port, pipeline, calibration):
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((host, port))
     server_sock.listen(1)
+    server_sock.settimeout(1)
     print(f"[SERVER] Listening on {host}:{port} ...")
     print("[SERVER] Waiting for client connection ...")
 
     try:
         while True:
-            conn, addr = server_sock.accept()
+            capture.check()
+            try:
+                conn, addr = server_sock.accept()
+            except socket.timeout:
+                continue
             print(f"[SERVER] Client connected: {addr}")
 
             try:
@@ -158,22 +255,12 @@ def _serve_pipeline(host, port, pipeline, calibration):
                 # Consume an optional legacy color-only request.
                 read_mode_byte(conn)  # Retain the existing optional client handshake.
 
+                sequence = 0
                 while True:
-                    try:
-                        frames = pipeline.wait_for_frames(5000)
-                    except RuntimeError as e:
-                        # Frame didn't arrive in time — log and keep going
-                        # instead of crashing the whole server.
-                        print(f"[SERVER] Frame wait failed: {e}; retrying")
+                    item = capture.next_frame(sequence)
+                    if item is None:
                         continue
-                    color_frame = frames.get_color_frame()
-                    if not color_frame:
-                        continue
-
-                    t_capture = time.time()
-
-                    # Color image (BGR)
-                    color_img = np.asanyarray(color_frame.get_data())
+                    sequence, color_img, t_capture = item
 
                     # Encode as JPEG for efficient transfer
                     ok, color_jpg = cv2.imencode(
@@ -213,7 +300,9 @@ def _serve_pipeline(host, port, pipeline, calibration):
                     # Send total packet size first, then the packet
                     send_frame(conn, packet)
 
-            except (ConnectionResetError, BrokenPipeError, ConnectionError):
+            except CameraCaptureError:
+                raise
+            except (ConnectionResetError, BrokenPipeError, ConnectionError, socket.timeout):
                 print(f"[SERVER] Client {addr} disconnected.")
             except Exception as e:
                 # Any other error: log full traceback but keep the server

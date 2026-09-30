@@ -4,6 +4,14 @@ Pi: realsense_server.py captures BGR8 640x480 at 30 FPS. No depth sensor,
 alignment, depth calibration, or depth scale is requested. GPIO17 NC and
 GPIO18 NeoPixel status remain in realsense_io.py. --no-io disables them.
 This reduces camera work; it does not guarantee recovery from USB/SDK faults.
+After warm-up/calibration, a dedicated rgb-capture thread continuously reads
+and copies frames into a one-frame buffer, even with no TCP client connected.
+TCP/JPEG processing consumes the latest frame; slow clients skip older frames.
+Ten seconds without RGB terminates capture and propagates an error to the server.
+Shutdown joins capture before pipeline.stop. A stuck native SDK call is reported;
+threading does not provide a hard kill or guarantee recovery from USB faults.
+The encode_ms column now includes waiting in the latest-frame buffer as well
+as JPEG processing (from host frame retrieval to encode completion).
 
 Laptop: install requirements-rgb-client.txt in a fresh environment, then:
 python realsense_client.py --host PI_IP --tag-size-m 0.10 --tag-family 36h11
