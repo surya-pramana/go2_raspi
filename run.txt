@@ -1,0 +1,12 @@
+
+raspi:
+sf-system@sfsystem-desktop:~/src/camera4/go2_raspi$ 
+
+sudo env PYTHONPATH=/home/sf-system/.local/lib/python3.10/site-packages   /home/sf-system/neopixel-test/.venv/bin/python3   -X faulthandler -u realsense_server.py   --host 0.0.0.0 --port 9999 --status-port 8765   --calibration-timing before-start   2>&1 | tee full_system_01.log
+
+
+client:
+ .\.venv\Scripts\python.exe realsense_client.py --host 172.20.10.2 --port 9999
+
+Visualisai
+python .\visualize_camera_csv.py "D:\go2_benchmark\results\camera_20261001_132500.csv" -o .\camera_benchmark_report.html

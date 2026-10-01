@@ -4,6 +4,13 @@
 .DS_Store
 Thumbs.db
 
+fileCompare/
+
+venv/
+cameraSDK
+.venv/
+debug_logs/
+
 # Python cache
 __pycache__/
 *.py[cod]
