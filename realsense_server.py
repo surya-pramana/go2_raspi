@@ -26,13 +26,19 @@ import pyrealsense2 as rs
 from realsense_io import ButtonStatusServer
 
 
-def create_pipeline(width=640, height=480, fps=30, serial=None):
+def create_pipeline(width=640, height=480, fps=30, serial=None, before_start=None):
     """Start RGB only. Fail once; do not reset/retry a failed native SDK session."""
     pipeline = rs.pipeline()
     config = rs.config()
     if serial is not None:
         config.enable_device(serial)
     config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+    if before_start is not None:
+        print('[STARTUP] Resolving RGB profile before streaming ...', flush=True)
+        resolved = config.resolve(rs.pipeline_wrapper(pipeline))
+        selected_serial = resolved.get_device().get_info(rs.camera_info.serial_number)
+        config.enable_device(selected_serial)
+        before_start(resolved)
     print("[STARTUP] Opening RGB camera ...", flush=True)
     pipeline.start(config)
     print("[STARTUP] RGB pipeline started.", flush=True)
@@ -84,15 +90,26 @@ def read_mode_byte(conn, timeout=0.5):
 
 def read_rgb_calibration(pipeline):
     """Read the actual active profile; never substitute guessed calibration."""
-    profile = pipeline.get_active_profile()
-    intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+    return read_profile_calibration(pipeline.get_active_profile())
+
+
+def read_profile_calibration(profile):
+    video = profile.get_stream(rs.stream.color).as_video_stream_profile()
+    print('[CALIBRATION] Calling RGB get_intrinsics() ...', flush=True)
+    started = time.monotonic()
+    try:
+        intr = video.get_intrinsics()
+    except RuntimeError as exc:
+        raise RuntimeError(f'RGB get_intrinsics failed after {time.monotonic()-started:.2f}s: {exc}') from exc
+    print(f'[CALIBRATION] RGB intrinsics received in {time.monotonic()-started:.2f}s.', flush=True)
     values = [intr.fx, intr.fy, intr.ppx, intr.ppy, *intr.coeffs]
     if not np.isfinite(values).all() or intr.fx <= 0 or intr.fy <= 0:
         raise RuntimeError("Invalid RGB calibration")
     return dict(width=intr.width, height=intr.height, fx=intr.fx, fy=intr.fy,
                 ppx=intr.ppx, ppy=intr.ppy, coeffs=list(intr.coeffs),
                 model=str(intr.model), serial=profile.get_device().get_info(rs.camera_info.serial_number),
-                stream='color', pixel_format='bgr8', protocol_version=2)
+                stream='color', pixel_format='bgr8', fps=video.fps(),
+                calibration_source='device', protocol_version=2)
 
 
 def load_rgb_calibration(path):
@@ -223,17 +240,32 @@ class LatestRGB:
                                      'Check the process before restarting.')
 
 
-def serve(host, port, calibration_file=None):
+def serve(host, port, calibration_file=None, calibration_timing='after-warmup'):
+    if calibration_timing not in ('before-start', 'after-start', 'after-warmup'):
+        raise ValueError('Invalid calibration timing')
+    if calibration_file and calibration_timing != 'after-warmup':
+        raise ValueError('Choose saved calibration or live calibration timing, not both')
     calibration = load_rgb_calibration(calibration_file) if calibration_file else None
-    pipeline = (create_pipeline(serial=calibration['serial']) if calibration is not None
-                else create_pipeline())
+    def read_before_start(profile):
+        nonlocal calibration
+        calibration = read_profile_calibration(profile)
+    if calibration_file:
+        pipeline = create_pipeline(serial=calibration['serial'])
+    elif calibration_timing == 'before-start':
+        pipeline = create_pipeline(before_start=read_before_start)
+    else:
+        pipeline = create_pipeline()
     capture = None
     try:
+        if calibration_timing == 'after-start':
+            calibration = read_rgb_calibration(pipeline)
+        if calibration_timing == 'before-start':
+            verify_saved_profile(pipeline, calibration)
         warm_up_camera(pipeline)
         if calibration is None:
             print("[STARTUP] Reading RGB calibration ...", flush=True)
             calibration = read_rgb_calibration(pipeline)
-        else:
+        elif calibration_file:
             verify_saved_profile(pipeline, calibration)
             print(f'[STARTUP] Saved RGB calibration verified: {calibration_file}; '
                   'get_intrinsics() skipped.', flush=True)
@@ -388,7 +420,17 @@ if __name__ == '__main__':
                         help='Camera only, for hosts without Raspberry Pi GPIO')
     parser.add_argument('--calibration-file',
                         help='Explicit saved RGB calibration; binds camera serial and skips get_intrinsics')
+    parser.add_argument('--calibration-timing',
+                        choices=['before-start', 'after-start', 'after-warmup'],
+                        default='after-warmup', help='Live intrinsics query timing (default: after-warmup)')
+    parser.add_argument('--sdk-debug', action='store_true', help='Enable RealSense SDK diagnostic output')
     args = parser.parse_args()
+    if args.calibration_file and args.calibration_timing != 'after-warmup':
+        parser.error('--calibration-file cannot be combined with live calibration timing')
+    if args.sdk_debug:
+        rs.log_to_console(rs.log_severity.debug)
+    print(f'[SDK] Module: {rs.__file__}', flush=True)
+    print(f'[STARTUP] Calibration mode: {"file" if args.calibration_file else args.calibration_timing}', flush=True)
 
     def shutdown_requested(signum, frame):
         # TERM from the SSH stop script must run the same cleanup as Ctrl+C.
@@ -400,7 +442,7 @@ if __name__ == '__main__':
         if not args.no_io:
             io_status = ButtonStatusServer(args.host, args.status_port)
             io_status.start()
-        serve(args.host, args.port, args.calibration_file)
+        serve(args.host, args.port, args.calibration_file, args.calibration_timing)
     except KeyboardInterrupt:
         pass
     finally:

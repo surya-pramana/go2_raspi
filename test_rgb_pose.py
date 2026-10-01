@@ -18,6 +18,34 @@ CAL = dict(width=640, height=480, fx=600., fy=600., ppx=320., ppy=240.,
 
 
 class RGBPoseTests(unittest.TestCase):
+    def test_before_start_query_order_and_failure(self):
+        server = self.load_server()
+        events = []
+        server.rs.config.return_value.resolve.side_effect = lambda _: events.append('resolve') or MagicMock()
+        server.rs.pipeline.return_value.start.side_effect = lambda _: events.append('start')
+        server.create_pipeline(before_start=lambda _: events.append('intrinsics'))
+        self.assertEqual(events, ['resolve', 'intrinsics', 'start'])
+        server.rs.pipeline.return_value.start.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, 'USB'):
+            server.create_pipeline(before_start=MagicMock(side_effect=RuntimeError('USB')))
+        server.rs.pipeline.return_value.start.assert_not_called()
+
+    def test_live_timing_order(self):
+        for timing, expected in [('after-start', ['read', 'warmup', 'serve']),
+                                 ('after-warmup', ['warmup', 'read', 'serve'])]:
+            with self.subTest(timing=timing):
+                server = self.load_server()
+                events = []
+                pipeline = MagicMock()
+                with patch.object(server, 'create_pipeline', return_value=pipeline), \
+                     patch.object(server, 'warm_up_camera', side_effect=lambda _: events.append('warmup')), \
+                     patch.object(server, 'read_rgb_calibration', side_effect=lambda _: events.append('read') or CAL), \
+                     patch.object(server, 'LatestRGB'), \
+                     patch.object(server, '_serve_pipeline', side_effect=lambda *args: events.append('serve')):
+                    server.serve('localhost', 9999, calibration_timing=timing)
+                self.assertEqual(events, expected)
+                pipeline.stop.assert_called_once()
+
     def test_saved_calibration_skips_intrinsics_and_stops(self):
         server = self.load_server()
         path = Path(__file__).with_name('calibration_346522076825_rgb_640x480.json')

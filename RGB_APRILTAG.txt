@@ -1,5 +1,16 @@
 RGB-only branch testing/02
 =========================
+Saved calibration workaround for get_intrinsics USB timeouts:
+  python realsense_server.py --no-io --calibration-file calibration_346522076825_rgb_640x480.json
+The supplied JSON transcribes the user's earlier successful SDK read, not a
+new calibration measurement. Use only serial 346522076825, RGB 640x480 BGR8
+30 FPS with unchanged optics/calibration. Pose accuracy still needs physical
+validation. The server selects this serial and checks the active profile.
+Invalid/mismatched files fail explicitly; there is no automatic fallback.
+Without --calibration-file the original live calibration path remains active.
+Serial/profile queries still access the SDK; this is not a USB hardware repair.
+Deploy BOTH realsense_server.py and the JSON to the Pi. The TCP client is unchanged.
+
 Pi: realsense_server.py captures BGR8 640x480 at 30 FPS. No depth sensor,
 alignment, depth calibration, or depth scale is requested. GPIO17 NC and
 GPIO18 NeoPixel status remain in realsense_io.py. --no-io disables them.
