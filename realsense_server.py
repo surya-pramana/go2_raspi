@@ -249,6 +249,7 @@ def serve(host, port, calibration_file=None):
         print("[SHUTDOWN] Stopping RGB pipeline ...", flush=True)
         try:
             pipeline.stop()
+            pipeline = None
             print("[SHUTDOWN] RGB pipeline stopped.", flush=True)
         except RuntimeError as exc:
             print(f"[SHUTDOWN][ERROR] Camera stop failed: {exc}", flush=True)
